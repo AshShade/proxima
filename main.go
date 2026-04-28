@@ -6,8 +6,11 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 )
 
@@ -21,9 +24,10 @@ const socksAddr = "127.0.0.1:1080"
 var (
 	home       = os.Getenv("HOME")
 	base       = filepath.Join(home, ".proxima")
+	logsDir    = filepath.Join(base, "logs")
 	configPath = filepath.Join(base, "config.json")
 	caddyFile  = filepath.Join(base, "Caddyfile")
-	plistPath  = filepath.Join(home, "Library", "LaunchAgents", "com.proxima.caddy.plist")
+	plistPath  = filepath.Join(home, "Library", "LaunchAgents", "com.proxima.plist")
 )
 
 // localPort returns a deterministic local port for a given remote port.
@@ -45,62 +49,353 @@ func main() {
 		runStop()
 	case "status":
 		runStatus()
+	case "daemon":
+		runDaemon()
 	default:
 		fmt.Fprintf(os.Stderr, "Usage: proxima [start|stop|status]\n")
 		os.Exit(1)
 	}
 }
 
-// ── start ────────────────────────────────────────────────────────────────────
+// ── start ─────────────────────────────────────────────────────────────────────
+// Prepares config, writes the launchd plist, and loads it.
+// Returns immediately — launchd starts proxima daemon in the background.
 
 func runStart() {
-	fmt.Println("== Proxima ==")
+	fmt.Println("== Proxima: starting ==")
 
 	cfg := loadConfig()
 
-	killOldGost()
-	startGost(cfg)
-
-	// Give gost processes a moment to bind their ports.
-	time.Sleep(1 * time.Second)
-
+	fmt.Println("→ Syncing /etc/hosts")
 	syncHosts(cfg)
-	generateCaddyfile(cfg)
-	reloadCaddy()
 
-	fmt.Println("✔ Done")
+	fmt.Println("→ Generating Caddyfile")
+	generateCaddyfile(cfg)
+
+	fmt.Println("→ Registering with launchd")
+	proxBin, err := os.Executable()
+	if err != nil {
+		fatalf("cannot determine executable path: %v", err)
+	}
+
+	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.proxima</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>%s</string>
+		<string>daemon</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>%s/daemon.log</string>
+	<key>StandardErrorPath</key>
+	<string>%s/daemon.log</string>
+</dict>
+</plist>
+`, proxBin, logsDir, logsDir)
+
+	if err := os.MkdirAll(filepath.Dir(plistPath), 0755); err != nil {
+		fatalf("cannot create LaunchAgents dir: %v", err)
+	}
+	if err := os.MkdirAll(logsDir, 0755); err != nil {
+		fatalf("cannot create logs dir: %v", err)
+	}
+	if err := os.WriteFile(plistPath, []byte(plist), 0644); err != nil {
+		fatalf("cannot write plist: %v", err)
+	}
+
+	// Unload first so a re-run of start picks up any config changes.
+	exec.Command("launchctl", "unload", plistPath).Run() //nolint:errcheck
+	time.Sleep(300 * time.Millisecond)
+
+	out, err := exec.Command("launchctl", "load", plistPath).CombinedOutput()
+	if err != nil {
+		fatalf("launchctl load failed: %v\n%s", err, out)
+	}
+
+	fmt.Println("✔ Done — proxima daemon started via launchd")
 }
 
-// ── stop ─────────────────────────────────────────────────────────────────────
+// ── stop ──────────────────────────────────────────────────────────────────────
+// Unloads the launchd job (kills daemon + all children), cleans /etc/hosts.
 
 func runStop() {
 	fmt.Println("== Proxima: stopping ==")
 
-	// 1. Kill gost tunnels.
-	fmt.Println("→ Killing gost processes")
-	exec.Command("pkill", "-9", "-f", "gost -L=").Run() //nolint:errcheck
-
-	// 2. Unload Caddy from launchd (stops the process and prevents auto-restart).
-	fmt.Println("→ Stopping Caddy")
+	fmt.Println("→ Unloading launchd job")
 	out, err := exec.Command("launchctl", "unload", plistPath).CombinedOutput()
 	if err != nil {
-		// Not loaded is fine — just report unexpected errors.
-		if !strings.Contains(string(out), "Could not find specified service") &&
-			!strings.Contains(string(out), "No such file") {
-			fmt.Printf("  ↳ launchctl unload: %s\n", strings.TrimSpace(string(out)))
+		msg := strings.TrimSpace(string(out))
+		if !strings.Contains(msg, "Could not find") && !strings.Contains(msg, "No such file") {
+			fmt.Printf("  ↳ launchctl: %s\n", msg)
 		}
 	} else {
-		fmt.Println("  ↳ Caddy stopped")
+		fmt.Println("  ↳ daemon stopped")
 	}
 
-	// 3. Remove the proxima block from /etc/hosts.
+	// Belt-and-suspenders: kill any stray gost processes.
+	exec.Command("pkill", "-9", "-f", "gost -L=").Run() //nolint:errcheck
+
 	fmt.Println("→ Cleaning /etc/hosts")
 	removeHostsBlock()
 
 	fmt.Println("✔ Done")
 }
 
-// removeHostsBlock strips the proxima block from /etc/hosts.
+// ── status ────────────────────────────────────────────────────────────────────
+
+func runStatus() {
+	fmt.Println("== Proxima: status ==")
+
+	// Check if the launchd job is loaded.
+	daemonLoaded := launchdJobLoaded("com.proxima")
+	if daemonLoaded {
+		fmt.Println("daemon: ✔ running (launchd)")
+	} else {
+		fmt.Println("daemon: ✗ not running")
+	}
+
+	// Caddy admin API.
+	if tcpReachable("127.0.0.1:2019") {
+		fmt.Println("caddy:  ✔ running")
+	} else {
+		fmt.Println("caddy:  ✗ not running")
+	}
+
+	// SOCKS5 proxy.
+	if tcpReachable(socksAddr) {
+		fmt.Printf("socks5: ✔ reachable (%s)\n", socksAddr)
+	} else {
+		fmt.Printf("socks5: ✗ not reachable (%s)\n", socksAddr)
+	}
+
+	// Per-service tunnel status.
+	cfg, err := tryLoadConfig()
+	if err != nil {
+		fmt.Printf("\nconfig: ✗ %v\n", err)
+		return
+	}
+	if len(cfg.Services) == 0 {
+		return
+	}
+
+	fmt.Println()
+	fmt.Printf("%-16s %-12s %-12s %s\n", "SERVICE", "REMOTE PORT", "LOCAL PORT", "TUNNEL")
+	fmt.Println(strings.Repeat("─", 52))
+	for name, remotePort := range cfg.Services {
+		lp := localPort(remotePort)
+		status := "✔ up"
+		if !tcpReachable(fmt.Sprintf("127.0.0.1:%d", lp)) {
+			status = "✗ down"
+		}
+		fmt.Printf("%-16s %-12d %-12d %s\n", name, remotePort, lp, status)
+	}
+}
+
+// launchdJobLoaded returns true if the given launchd job label is loaded.
+func launchdJobLoaded(label string) bool {
+	out, err := exec.Command("launchctl", "list", label).CombinedOutput()
+	if err != nil {
+		return false
+	}
+	return !strings.Contains(string(out), "Could not find")
+}
+
+// ── daemon ────────────────────────────────────────────────────────────────────
+// Long-running process managed by launchd.
+// Spawns caddy and gost as children, truncates log files every hour, exits on SIGTERM.
+
+func runDaemon() {
+	cfg := loadConfig()
+
+	// Fresh logs directory on every daemon start.
+	os.RemoveAll(logsDir)
+	if err := os.MkdirAll(logsDir, 0755); err != nil {
+		fatalf("cannot create logs dir: %v", err)
+	}
+
+	// Track all child processes for clean shutdown.
+	var (
+		mu       sync.Mutex
+		children []*exec.Cmd
+	)
+
+	addChild := func(c *exec.Cmd) {
+		mu.Lock()
+		children = append(children, c)
+		mu.Unlock()
+	}
+
+	killChildren := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range children {
+			if c.Process != nil {
+				c.Process.Kill() //nolint:errcheck
+			}
+		}
+	}
+
+	// Handle SIGTERM / SIGINT for clean shutdown.
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		<-sigs
+		killChildren()
+		os.Exit(0)
+	}()
+
+	// Start caddy and gost tunnels.
+	addChild(startCaddy())
+	for name, remotePort := range cfg.Services {
+		if cmd := startGostTunnel(name, remotePort); cmd != nil {
+			addChild(cmd)
+		}
+	}
+
+	// Truncate all log files every hour on the hour.
+	// Children keep their file handles open — truncating works fine on macOS/Linux;
+	// the process continues writing from byte 0 after the truncation.
+	go func() {
+		for {
+			now := time.Now()
+			next := now.Truncate(time.Hour).Add(time.Hour)
+			time.Sleep(time.Until(next))
+			truncateLogs(cfg)
+		}
+	}()
+
+	// Block forever (signal handler above handles exit).
+	select {}
+}
+
+// truncateLogs wipes all log files to zero bytes every hour.
+// Child processes keep their file handles open and continue writing from byte 0.
+func truncateLogs(cfg Config) {
+	names := []string{"caddy"}
+	for name := range cfg.Services {
+		names = append(names, "gost-"+name)
+	}
+	for _, name := range names {
+		path := filepath.Join(logsDir, name+".log")
+		if f, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0644); err == nil {
+			f.Close()
+		}
+	}
+}
+
+// openLog opens (or creates) the log file for the given name.
+func openLog(name string) *os.File {
+	f, err := os.OpenFile(
+		filepath.Join(logsDir, name+".log"),
+		os.O_CREATE|os.O_WRONLY|os.O_APPEND,
+		0644,
+	)
+	if err != nil {
+		return nil
+	}
+	return f
+}
+
+// startCaddy spawns caddy run as a child process.
+func startCaddy() *exec.Cmd {
+	cmd := exec.Command("caddy", "run", "--config", caddyFile)
+	if f := openLog("caddy"); f != nil {
+		cmd.Stdout = f
+		cmd.Stderr = f
+	}
+	if err := cmd.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "caddy start failed: %v\n", err)
+		return cmd
+	}
+	go cmd.Wait() //nolint:errcheck
+	return cmd
+}
+
+// startGostTunnel spawns a single gost TCP tunnel as a child process.
+func startGostTunnel(name string, remotePort int) *exec.Cmd {
+	lp := localPort(remotePort)
+	listenAddr := fmt.Sprintf("tcp://127.0.0.1:%d/localhost:%d", lp, remotePort)
+	forwardAddr := fmt.Sprintf("socks5://%s", socksAddr)
+
+	cmd := exec.Command("gost", "-L="+listenAddr, "-F="+forwardAddr)
+	if f := openLog("gost-" + name); f != nil {
+		cmd.Stdout = f
+		cmd.Stderr = f
+	}
+	if err := cmd.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "gost start failed (%s): %v\n", name, err)
+		return nil
+	}
+	go cmd.Wait() //nolint:errcheck
+	return cmd
+}
+
+// ── /etc/hosts ────────────────────────────────────────────────────────────────
+
+func syncHosts(cfg Config) {
+	const blockStart = ">>> proxima start"
+	const blockEnd = "<<< proxima end"
+
+	raw, err := os.ReadFile("/etc/hosts")
+	if err != nil {
+		fatalf("cannot read /etc/hosts: %v", err)
+	}
+
+	var kept []string
+	inBlock := false
+	for _, line := range strings.Split(string(raw), "\n") {
+		if strings.Contains(line, blockStart) {
+			inBlock = true
+			continue
+		}
+		if strings.Contains(line, blockEnd) {
+			inBlock = false
+			continue
+		}
+		if !inBlock {
+			kept = append(kept, line)
+		}
+	}
+
+	for len(kept) > 0 && strings.TrimSpace(kept[len(kept)-1]) == "" {
+		kept = kept[:len(kept)-1]
+	}
+
+	var block []string
+	block = append(block, "")
+	block = append(block, blockStart)
+	for name := range cfg.Services {
+		block = append(block, fmt.Sprintf("127.0.0.1 %s.dev.local", name))
+	}
+	block = append(block, blockEnd)
+	block = append(block, "")
+
+	result := strings.Join(append(kept, block...), "\n")
+
+	tmp := "/tmp/hosts.proxima"
+	if err := os.WriteFile(tmp, []byte(result), 0644); err != nil {
+		fatalf("cannot write temp hosts file: %v", err)
+	}
+	out, err := exec.Command("sudo", "cp", tmp, "/etc/hosts").CombinedOutput()
+	if err != nil {
+		fatalf("sudo cp to /etc/hosts failed: %v\n%s", err, out)
+	}
+}
+
 func removeHostsBlock() {
 	const blockStart = ">>> proxima start"
 	const blockEnd = "<<< proxima end"
@@ -127,7 +422,6 @@ func removeHostsBlock() {
 		}
 	}
 
-	// Trim trailing blank lines.
 	for len(kept) > 0 && strings.TrimSpace(kept[len(kept)-1]) == "" {
 		kept = kept[:len(kept)-1]
 	}
@@ -146,250 +440,27 @@ func removeHostsBlock() {
 	fmt.Println("  ↳ /etc/hosts cleaned")
 }
 
-// ── status ───────────────────────────────────────────────────────────────────
+// ── Caddyfile ─────────────────────────────────────────────────────────────────
 
-func runStatus() {
-	fmt.Println("== Proxima: status ==")
-
-	// Load config — soft fail so status works even with a broken config.
-	cfg, err := tryLoadConfig()
-	if err != nil {
-		fmt.Printf("  config: ✗ %v\n\n", err)
-	}
-
-	// Caddy.
-	caddyRunning := caddyIsRunning()
-	if caddyRunning {
-		fmt.Println("caddy:  ✔ running")
-	} else {
-		fmt.Println("caddy:  ✗ not running")
-	}
-
-	// SOCKS5 proxy.
-	socksUp := portInUse2(socksAddr)
-	if socksUp {
-		fmt.Printf("socks5: ✔ reachable (%s)\n", socksAddr)
-	} else {
-		fmt.Printf("socks5: ✗ not reachable (%s)\n", socksAddr)
-	}
-
-	if err != nil || len(cfg.Services) == 0 {
-		return
-	}
-
-	// Per-service tunnel status.
-	fmt.Println()
-	fmt.Printf("%-16s %-12s %-12s %s\n", "SERVICE", "REMOTE PORT", "LOCAL PORT", "TUNNEL")
-	fmt.Println(strings.Repeat("─", 52))
-
-	for name, remotePort := range cfg.Services {
-		lp := localPort(remotePort)
-		tunnelUp := portInUse2(fmt.Sprintf("127.0.0.1:%d", lp))
-		status := "✔ up"
-		if !tunnelUp {
-			status = "✗ down"
-		}
-		fmt.Printf("%-16s %-12d %-12d %s\n", name, remotePort, lp, status)
-	}
-}
-
-// caddyIsRunning checks whether Caddy's admin API is responding.
-func caddyIsRunning() bool {
-	return portInUse2("127.0.0.1:2019")
-}
-
-// portInUse2 checks whether a TCP address is reachable.
-func portInUse2(addr string) bool {
-	conn, err := net.DialTimeout("tcp", addr, 300*time.Millisecond)
-	if err != nil {
-		return false
-	}
-	conn.Close()
-	return true
-}
-
-// tryLoadConfig loads config without calling fatalf — returns an error instead.
-func tryLoadConfig() (Config, error) {
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		return Config{}, fmt.Errorf("cannot read %s: %w", configPath, err)
-	}
-	var cfg Config
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return Config{}, fmt.Errorf("invalid JSON in %s: %w", configPath, err)
-	}
-	return cfg, nil
-}
-
-// ── shared helpers ────────────────────────────────────────────────────────────
-
-// loadConfig reads ~/.proxima/config.json.
-// It fails loudly if the file is missing or malformed.
-func loadConfig() Config {
-	if err := os.MkdirAll(base, 0755); err != nil {
-		fatalf("cannot create config dir %s: %v", base, err)
-	}
-
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		fatalf("cannot read config %s: %v\n\nCreate it with:\n%s", configPath, err, exampleConfig())
-	}
-
-	var cfg Config
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		fatalf("invalid config JSON in %s: %v", configPath, err)
-	}
-
-	if len(cfg.Services) == 0 {
-		fatalf("config has no services defined in %s", configPath)
-	}
-
-	return cfg
-}
-
-func exampleConfig() string {
-	return `{
-  "services": {
-    "myapp": 7777,
-    "api": 3000
-  }
-}`
-}
-
-// killOldGost terminates any previously spawned gost processes.
-// pkill failure is non-fatal (nothing to kill is fine).
-func killOldGost() {
-	fmt.Println("→ Killing old gost processes")
-	// Match any gost process we may have spawned, regardless of mode.
-	// -9 ensures they die even if they ignore SIGTERM.
-	exec.Command("pkill", "-9", "-f", "gost -L=").Run() //nolint:errcheck
-	// Give the OS a moment to release the ports before we check portInUse.
-	time.Sleep(300 * time.Millisecond)
-}
-
-// portInUse returns true if something is already listening on the given TCP port.
-func portInUse(port int) bool {
-	return portInUse2(fmt.Sprintf("127.0.0.1:%d", port))
-}
-
-// startGost spawns one gost TCP-tunnel process per service.
-//
-// gost v3 TCP port forwarding syntax:
-//
-//	gost -L=tcp://127.0.0.1:<lp>/localhost:<remotePort> -F=socks5://127.0.0.1:1080
-//
-// The destination address (localhost:<remotePort>) is forwarded through the
-// SOCKS5 chain, so "localhost" resolves on the REMOTE host — not locally.
-// This is the correct way to reach a service on the remote machine's loopback.
-func startGost(cfg Config) {
-	fmt.Println("→ Starting gost processes")
-
-	for name, remotePort := range cfg.Services {
-		lp := localPort(remotePort)
-
-		if portInUse(lp) {
-			fmt.Printf("  ↳ %s: port %d already in use, skipping\n", name, lp)
-			continue
-		}
-
-		// tcp://bind/destination — destination is resolved via the SOCKS5 proxy (remote side)
-		listenAddr := fmt.Sprintf("tcp://127.0.0.1:%d/localhost:%d", lp, remotePort)
-		forwardAddr := fmt.Sprintf("socks5://%s", socksAddr)
-
-		cmd := exec.Command("gost", "-L="+listenAddr, "-F="+forwardAddr)
-
-		// Declare svcName here so it's available for both the log filename and the goroutine.
-		svcName := name
-		logFile := filepath.Join(base, fmt.Sprintf("gost-%s.log", svcName))
-		f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-		if err != nil {
-			cmd.Stdout = nil
-			cmd.Stderr = nil
-		} else {
-			cmd.Stdout = f
-			cmd.Stderr = f
-		}
-
-		fmt.Printf("  ↳ %s: local %d → SOCKS5 → remote localhost:%d\n", name, lp, remotePort)
-
-		go func(c *exec.Cmd) {
-			if err := c.Run(); err != nil {
-				fmt.Printf("  gost exited (%s): %v\n", svcName, err)
-			}
-		}(cmd)
-	}
-}
-
-// syncHosts rewrites /etc/hosts, replacing the proxima block entirely.
-// Uses a temp file + sudo cp to avoid requiring the binary to run as root.
-func syncHosts(cfg Config) {
-	fmt.Println("→ Syncing /etc/hosts")
-
-	const blockStart = ">>> proxima start"
-	const blockEnd = "<<< proxima end"
-
-	raw, err := os.ReadFile("/etc/hosts")
-	if err != nil {
-		fatalf("cannot read /etc/hosts: %v", err)
-	}
-
-	// Strip the old proxima block (if any).
-	var kept []string
-	inBlock := false
-	for _, line := range strings.Split(string(raw), "\n") {
-		if strings.Contains(line, blockStart) {
-			inBlock = true
-			continue
-		}
-		if strings.Contains(line, blockEnd) {
-			inBlock = false
-			continue
-		}
-		if !inBlock {
-			kept = append(kept, line)
-		}
-	}
-
-	// Remove trailing blank lines so we get a clean join.
-	for len(kept) > 0 && strings.TrimSpace(kept[len(kept)-1]) == "" {
-		kept = kept[:len(kept)-1]
-	}
-
-	// Build the new block.
-	var block []string
-	block = append(block, "")
-	block = append(block, blockStart)
-	for name := range cfg.Services {
-		block = append(block, fmt.Sprintf("127.0.0.1 %s.dev.local", name))
-	}
-	block = append(block, blockEnd)
-	block = append(block, "")
-
-	result := strings.Join(append(kept, block...), "\n")
-
-	tmp := "/tmp/hosts.proxima"
-	if err := os.WriteFile(tmp, []byte(result), 0644); err != nil {
-		fatalf("cannot write temp hosts file: %v", err)
-	}
-
-	out, err := exec.Command("sudo", "cp", tmp, "/etc/hosts").CombinedOutput()
-	if err != nil {
-		fatalf("sudo cp to /etc/hosts failed: %v\n%s", err, out)
-	}
-}
-
-// generateCaddyfile writes ~/.proxima/Caddyfile and auto-formats it
-// so Caddy doesn't emit the "not formatted" warning on load.
 func generateCaddyfile(cfg Config) {
-	fmt.Println("→ Generating Caddyfile")
-
 	var sb strings.Builder
 
+	// Global block: log caddy's own output to the logs dir, hourly rotation.
+	sb.WriteString(fmt.Sprintf(
+		"{\n"+
+			"\tlog {\n"+
+			"\t\toutput file %s {\n"+
+			"\t\t\troll_interval 1h\n"+
+			"\t\t\troll_keep     2\n"+
+			"\t\t\troll_keep_for 2h\n"+
+			"\t\t}\n"+
+			"\t}\n"+
+			"}\n\n",
+		filepath.Join(logsDir, "caddy.log"),
+	))
+
 	for name, remotePort := range cfg.Services {
 		lp := localPort(remotePort)
-		// The gost TCP tunnel already routes to the correct remote port,
-		// so Caddy just needs to set Host: localhost (no port suffix).
-		// Many dev servers (Vite, Next.js, etc.) reject Host headers with ports.
 		sb.WriteString(fmt.Sprintf(
 			"https://%s.dev.local {\n"+
 				"\treverse_proxy http://127.0.0.1:%d {\n"+
@@ -404,76 +475,59 @@ func generateCaddyfile(cfg Config) {
 		fatalf("cannot write Caddyfile: %v", err)
 	}
 
-	// Format in-place so Caddy doesn't warn about formatting on every reload.
 	exec.Command("caddy", "fmt", "--overwrite", caddyFile).Run() //nolint:errcheck
 }
 
-// reloadCaddy tries `caddy reload` first; if Caddy isn't running it installs
-// and loads the launchd plist so Caddy starts (and stays running).
-func reloadCaddy() {
-	fmt.Println("→ Reloading Caddy")
+// ── config ────────────────────────────────────────────────────────────────────
 
-	reloadOut, err := exec.Command("caddy", "reload", "--config", caddyFile).CombinedOutput()
-	if err == nil {
-		fmt.Println("  ↳ caddy reloaded successfully")
-		return
+func loadConfig() Config {
+	if err := os.MkdirAll(base, 0755); err != nil {
+		fatalf("cannot create config dir %s: %v", base, err)
 	}
-
-	// Caddy is not running — set up launchd plist and start it.
-	// Only show the reload error if it's something unexpected (not just "connection refused").
-	if !strings.Contains(string(reloadOut), "connection refused") {
-		fmt.Printf("  ↳ caddy reload: %s\n", strings.TrimSpace(string(reloadOut)))
-	}
-	fmt.Println("  ↳ caddy not running, installing launchd plist")
-
-	caddyBin, err := exec.LookPath("caddy")
+	data, err := os.ReadFile(configPath)
 	if err != nil {
-		fatalf("caddy binary not found in PATH: %v", err)
+		fatalf("cannot read config %s: %v\n\nCreate it with:\n%s", configPath, err, exampleConfig())
 	}
-
-	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-	<key>Label</key>
-	<string>com.proxima.caddy</string>
-	<key>ProgramArguments</key>
-	<array>
-		<string>%s</string>
-		<string>run</string>
-		<string>--config</string>
-		<string>%s</string>
-	</array>
-	<key>RunAtLoad</key>
-	<true/>
-	<key>KeepAlive</key>
-	<true/>
-	<key>StandardOutPath</key>
-	<string>%s/caddy.log</string>
-	<key>StandardErrorPath</key>
-	<string>%s/caddy.err</string>
-</dict>
-</plist>
-`, caddyBin, caddyFile, base, base)
-
-	if err := os.MkdirAll(filepath.Dir(plistPath), 0755); err != nil {
-		fatalf("cannot create LaunchAgents dir: %v", err)
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		fatalf("invalid config JSON in %s: %v", configPath, err)
 	}
-
-	if err := os.WriteFile(plistPath, []byte(plist), 0644); err != nil {
-		fatalf("cannot write plist: %v", err)
+	if len(cfg.Services) == 0 {
+		fatalf("config has no services defined in %s", configPath)
 	}
+	return cfg
+}
 
-	// Unload first (ignore error — it may not be loaded yet).
-	exec.Command("launchctl", "unload", plistPath).Run() //nolint:errcheck
-
-	out, err := exec.Command("launchctl", "load", plistPath).CombinedOutput()
+func tryLoadConfig() (Config, error) {
+	data, err := os.ReadFile(configPath)
 	if err != nil {
-		fatalf("launchctl load failed: %v\n%s", err, out)
+		return Config{}, fmt.Errorf("cannot read %s: %w", configPath, err)
 	}
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return Config{}, fmt.Errorf("invalid JSON in %s: %w", configPath, err)
+	}
+	return cfg, nil
+}
 
-	fmt.Println("  ↳ caddy started via launchd")
+func exampleConfig() string {
+	return `{
+  "services": {
+    "myapp": 7777,
+    "api": 3000
+  }
+}`
+}
+
+// ── utilities ─────────────────────────────────────────────────────────────────
+
+func tcpReachable(addr string) bool {
+	conn, err := net.DialTimeout("tcp", addr, 300*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
 }
 
 func fatalf(format string, args ...any) {

@@ -95,15 +95,21 @@ Local ports are assigned deterministically: `local = 10000 + remote`. So:
 
 No port conflicts, no configuration needed.
 
-**5. Caddy persistence — launchd**
+**5. Process management — launchd**
 
-Caddy is managed by macOS `launchd` via a plist at:
+`proxima` registers itself as a launchd agent (`com.proxima`). launchd starts the `proxima daemon` process at login and keeps it alive. The daemon owns Caddy and all gost tunnels as child processes — when the daemon stops, everything stops with it.
 
 ```
-~/Library/LaunchAgents/com.proxima.caddy.plist
+launchd
+  └── proxima daemon
+        ├── caddy run
+        ├── gost (service 1)
+        └── gost (service 2)
 ```
 
-With `KeepAlive = true`, launchd restarts Caddy if it crashes and starts it automatically on login. On subsequent `./proxima` runs, Caddy is already running and `caddy reload` is used to pick up config changes without restarting.
+**6. Log management**
+
+All logs go to `~/.proxima/logs/`. The daemon truncates every log file to zero bytes on the hour, so they never grow unbounded. The logs directory is wiped and recreated fresh on each `proxima start`.
 
 ---
 
@@ -119,9 +125,15 @@ With `KeepAlive = true`, launchd restarts Caddy if it crashes and starts it auto
 ## Installation
 
 ```bash
-git clone <repo>
+git clone https://github.com/AshShade/proxima
 cd proxima
 go build -o proxima .
+```
+
+Move the binary somewhere on your PATH if you want to run it from anywhere:
+
+```bash
+mv proxima /usr/local/bin/proxima
 ```
 
 ---
@@ -148,7 +160,7 @@ Each key is a service name. The value is the port the service listens on **on th
 Make sure your SOCKS5 proxy is running first, then:
 
 ```bash
-./proxima start   # or just ./proxima
+proxima start
 ```
 
 On first run it will ask for your password once (to write `/etc/hosts` via `sudo`). After that, open your browser:
@@ -160,16 +172,19 @@ https://api.dev.local
 
 Your browser will warn about the self-signed certificate on first visit. Accept it (or add Caddy's root CA to your keychain with `caddy trust`).
 
+`proxima start` returns immediately — the daemon runs in the background via launchd and will restart automatically on login.
+
 ### Check status
 
 ```bash
-./proxima status
+proxima status
 ```
 
 Example output:
 
 ```
 == Proxima: status ==
+daemon: ✔ running (launchd)
 caddy:  ✔ running
 socks5: ✔ reachable (127.0.0.1:1080)
 
@@ -182,17 +197,16 @@ api              3000         13000        ✔ up
 ### Stop everything
 
 ```bash
-./proxima stop
+proxima stop
 ```
 
-This kills all gost tunnel processes, stops Caddy via launchd, and removes the proxima block from `/etc/hosts`. Run `./proxima start` to bring it all back up.
+Unloads the launchd job, which kills the daemon and all child processes (Caddy + gost), and removes the proxima block from `/etc/hosts`.
 
 ### Re-running start
 
-Run `./proxima start` again any time you:
+Run `proxima start` again any time you:
 - Add or remove a service from the config
-- Restart your machine (gost processes don't survive reboots; Caddy does via launchd)
-- The SOCKS5 proxy reconnects after a drop
+- Want to restart everything after a SOCKS5 reconnect
 
 ---
 
@@ -200,14 +214,16 @@ Run `./proxima start` again any time you:
 
 ```
 ~/.proxima/
-├── config.json       # your service definitions
-├── Caddyfile         # generated on each run
-├── caddy.log         # Caddy stdout
-├── caddy.err         # Caddy stderr
-└── gost-<name>.log   # per-service gost logs
+├── config.json        # your service definitions
+├── Caddyfile          # generated on each start
+└── logs/
+    ├── daemon.log     # proxima daemon stdout/stderr
+    ├── caddy.log      # Caddy logs (truncated hourly)
+    ├── gost-myapp.log # per-service gost logs (truncated hourly)
+    └── gost-api.log
 
 ~/Library/LaunchAgents/
-└── com.proxima.caddy.plist   # keeps Caddy running
+└── com.proxima.plist  # keeps the daemon running
 ```
 
 ---
@@ -215,7 +231,7 @@ Run `./proxima start` again any time you:
 ## Troubleshooting
 
 **Browser shows "connection refused"**
-The gost tunnel isn't running. Run `./proxima start` again, or check `./proxima status`.
+The gost tunnel isn't running. Check `proxima status` and run `proxima start` again.
 
 **Browser shows HTTP 400**
 The remote service is rejecting the request. Check that the port in `config.json` is correct and the service is actually running on the remote machine.
@@ -223,14 +239,17 @@ The remote service is rejecting the request. Check that the port in `config.json
 **Browser shows SSL error / certificate not trusted**
 Run `caddy trust` once to add Caddy's local CA to your macOS keychain. You only need to do this once.
 
-**`sudo` password prompt on every run**
+**`sudo` password prompt on every start**
 This is expected — writing `/etc/hosts` requires root. You can add a sudoers rule to skip the password for this specific command:
 ```
 your_username ALL=(ALL) NOPASSWD: /bin/cp /tmp/hosts.proxima /etc/hosts
 ```
 
+**Tunnels show "down" in status**
+Check `~/.proxima/logs/gost-<name>.log` for errors. The most common cause is the SOCKS5 proxy not being reachable.
+
 **Caddy won't start**
-Check `~/.proxima/caddy.err` for errors. Port 443 may be in use by another process (`sudo lsof -i :443`).
+Check `~/.proxima/logs/caddy.log` for errors. Port 443 may be in use by another process (`sudo lsof -i :443`).
 
 **gost exits immediately**
 The SOCKS5 proxy at `127.0.0.1:1080` is not reachable. Make sure your SSH tunnel or proxy is running before starting proxima.
