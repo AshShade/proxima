@@ -33,6 +33,27 @@ func localPort(remotePort int) int {
 }
 
 func main() {
+	cmd := "start"
+	if len(os.Args) > 1 {
+		cmd = os.Args[1]
+	}
+
+	switch cmd {
+	case "start":
+		runStart()
+	case "stop":
+		runStop()
+	case "status":
+		runStatus()
+	default:
+		fmt.Fprintf(os.Stderr, "Usage: proxima [start|stop|status]\n")
+		os.Exit(1)
+	}
+}
+
+// ── start ────────────────────────────────────────────────────────────────────
+
+func runStart() {
 	fmt.Println("== Proxima ==")
 
 	cfg := loadConfig()
@@ -49,6 +70,158 @@ func main() {
 
 	fmt.Println("✔ Done")
 }
+
+// ── stop ─────────────────────────────────────────────────────────────────────
+
+func runStop() {
+	fmt.Println("== Proxima: stopping ==")
+
+	// 1. Kill gost tunnels.
+	fmt.Println("→ Killing gost processes")
+	exec.Command("pkill", "-9", "-f", "gost -L=").Run() //nolint:errcheck
+
+	// 2. Unload Caddy from launchd (stops the process and prevents auto-restart).
+	fmt.Println("→ Stopping Caddy")
+	out, err := exec.Command("launchctl", "unload", plistPath).CombinedOutput()
+	if err != nil {
+		// Not loaded is fine — just report unexpected errors.
+		if !strings.Contains(string(out), "Could not find specified service") &&
+			!strings.Contains(string(out), "No such file") {
+			fmt.Printf("  ↳ launchctl unload: %s\n", strings.TrimSpace(string(out)))
+		}
+	} else {
+		fmt.Println("  ↳ Caddy stopped")
+	}
+
+	// 3. Remove the proxima block from /etc/hosts.
+	fmt.Println("→ Cleaning /etc/hosts")
+	removeHostsBlock()
+
+	fmt.Println("✔ Done")
+}
+
+// removeHostsBlock strips the proxima block from /etc/hosts.
+func removeHostsBlock() {
+	const blockStart = ">>> proxima start"
+	const blockEnd = "<<< proxima end"
+
+	raw, err := os.ReadFile("/etc/hosts")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  ↳ cannot read /etc/hosts: %v\n", err)
+		return
+	}
+
+	var kept []string
+	inBlock := false
+	for _, line := range strings.Split(string(raw), "\n") {
+		if strings.Contains(line, blockStart) {
+			inBlock = true
+			continue
+		}
+		if strings.Contains(line, blockEnd) {
+			inBlock = false
+			continue
+		}
+		if !inBlock {
+			kept = append(kept, line)
+		}
+	}
+
+	// Trim trailing blank lines.
+	for len(kept) > 0 && strings.TrimSpace(kept[len(kept)-1]) == "" {
+		kept = kept[:len(kept)-1]
+	}
+	result := strings.Join(kept, "\n") + "\n"
+
+	tmp := "/tmp/hosts.proxima"
+	if err := os.WriteFile(tmp, []byte(result), 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "  ↳ cannot write temp file: %v\n", err)
+		return
+	}
+	out, err := exec.Command("sudo", "cp", tmp, "/etc/hosts").CombinedOutput()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  ↳ sudo cp failed: %v\n%s\n", err, out)
+		return
+	}
+	fmt.Println("  ↳ /etc/hosts cleaned")
+}
+
+// ── status ───────────────────────────────────────────────────────────────────
+
+func runStatus() {
+	fmt.Println("== Proxima: status ==")
+
+	// Load config — soft fail so status works even with a broken config.
+	cfg, err := tryLoadConfig()
+	if err != nil {
+		fmt.Printf("  config: ✗ %v\n\n", err)
+	}
+
+	// Caddy.
+	caddyRunning := caddyIsRunning()
+	if caddyRunning {
+		fmt.Println("caddy:  ✔ running")
+	} else {
+		fmt.Println("caddy:  ✗ not running")
+	}
+
+	// SOCKS5 proxy.
+	socksUp := portInUse2(socksAddr)
+	if socksUp {
+		fmt.Printf("socks5: ✔ reachable (%s)\n", socksAddr)
+	} else {
+		fmt.Printf("socks5: ✗ not reachable (%s)\n", socksAddr)
+	}
+
+	if err != nil || len(cfg.Services) == 0 {
+		return
+	}
+
+	// Per-service tunnel status.
+	fmt.Println()
+	fmt.Printf("%-16s %-12s %-12s %s\n", "SERVICE", "REMOTE PORT", "LOCAL PORT", "TUNNEL")
+	fmt.Println(strings.Repeat("─", 52))
+
+	for name, remotePort := range cfg.Services {
+		lp := localPort(remotePort)
+		tunnelUp := portInUse2(fmt.Sprintf("127.0.0.1:%d", lp))
+		status := "✔ up"
+		if !tunnelUp {
+			status = "✗ down"
+		}
+		fmt.Printf("%-16s %-12d %-12d %s\n", name, remotePort, lp, status)
+	}
+}
+
+// caddyIsRunning checks whether Caddy's admin API is responding.
+func caddyIsRunning() bool {
+	return portInUse2("127.0.0.1:2019")
+}
+
+// portInUse2 checks whether a TCP address is reachable.
+func portInUse2(addr string) bool {
+	conn, err := net.DialTimeout("tcp", addr, 300*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
+}
+
+// tryLoadConfig loads config without calling fatalf — returns an error instead.
+func tryLoadConfig() (Config, error) {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return Config{}, fmt.Errorf("cannot read %s: %w", configPath, err)
+	}
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return Config{}, fmt.Errorf("invalid JSON in %s: %w", configPath, err)
+	}
+	return cfg, nil
+}
+
+// ── shared helpers ────────────────────────────────────────────────────────────
 
 // loadConfig reads ~/.proxima/config.json.
 // It fails loudly if the file is missing or malformed.
@@ -96,18 +269,14 @@ func killOldGost() {
 
 // portInUse returns true if something is already listening on the given TCP port.
 func portInUse(port int) bool {
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 200*time.Millisecond)
-	if err != nil {
-		return false
-	}
-	conn.Close()
-	return true
+	return portInUse2(fmt.Sprintf("127.0.0.1:%d", port))
 }
 
 // startGost spawns one gost TCP-tunnel process per service.
 //
 // gost v3 TCP port forwarding syntax:
-//   gost -L=tcp://127.0.0.1:<lp>/localhost:<remotePort> -F=socks5://127.0.0.1:1080
+//
+//	gost -L=tcp://127.0.0.1:<lp>/localhost:<remotePort> -F=socks5://127.0.0.1:1080
 //
 // The destination address (localhost:<remotePort>) is forwarded through the
 // SOCKS5 chain, so "localhost" resolves on the REMOTE host — not locally.
@@ -155,7 +324,7 @@ func syncHosts(cfg Config) {
 		fatalf("cannot read /etc/hosts: %v", err)
 	}
 
-	// Strip the old devdesk block (if any).
+	// Strip the old proxima block (if any).
 	var kept []string
 	inBlock := false
 	for _, line := range strings.Split(string(raw), "\n") {

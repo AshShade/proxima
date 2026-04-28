@@ -148,7 +148,7 @@ Each key is a service name. The value is the port the service listens on **on th
 Make sure your SOCKS5 proxy is running first, then:
 
 ```bash
-./proxima
+./proxima start   # or just ./proxima
 ```
 
 On first run it will ask for your password once (to write `/etc/hosts` via `sudo`). After that, open your browser:
@@ -160,9 +160,36 @@ https://api.dev.local
 
 Your browser will warn about the self-signed certificate on first visit. Accept it (or add Caddy's root CA to your keychain with `caddy trust`).
 
-### Re-running
+### Check status
 
-Run `./proxima` again any time you:
+```bash
+./proxima status
+```
+
+Example output:
+
+```
+== Proxima: status ==
+caddy:  ✔ running
+socks5: ✔ reachable (127.0.0.1:1080)
+
+SERVICE          REMOTE PORT  LOCAL PORT   TUNNEL
+────────────────────────────────────────────────────
+myapp            7777         17777        ✔ up
+api              3000         13000        ✔ up
+```
+
+### Stop everything
+
+```bash
+./proxima stop
+```
+
+This kills all gost tunnel processes, stops Caddy via launchd, and removes the proxima block from `/etc/hosts`. Run `./proxima start` to bring it all back up.
+
+### Re-running start
+
+Run `./proxima start` again any time you:
 - Add or remove a service from the config
 - Restart your machine (gost processes don't survive reboots; Caddy does via launchd)
 - The SOCKS5 proxy reconnects after a drop
@@ -187,7 +214,7 @@ Run `./proxima` again any time you:
 ## Troubleshooting
 
 **Browser shows "connection refused"**
-The gost tunnel isn't running. Run `./proxima` again.
+The gost tunnel isn't running. Run `./proxima start` again, or check `./proxima status`.
 
 **Browser shows HTTP 400**
 The remote service is rejecting the request. Check that the port in `config.json` is correct and the service is actually running on the remote machine.
