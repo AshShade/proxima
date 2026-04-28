@@ -203,7 +203,8 @@ Run `./proxima start` again any time you:
 ├── config.json       # your service definitions
 ├── Caddyfile         # generated on each run
 ├── caddy.log         # Caddy stdout
-└── caddy.err         # Caddy stderr
+├── caddy.err         # Caddy stderr
+└── gost-<name>.log   # per-service gost logs
 
 ~/Library/LaunchAgents/
 └── com.proxima.caddy.plist   # keeps Caddy running

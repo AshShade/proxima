@@ -297,12 +297,21 @@ func startGost(cfg Config) {
 		forwardAddr := fmt.Sprintf("socks5://%s", socksAddr)
 
 		cmd := exec.Command("gost", "-L="+listenAddr, "-F="+forwardAddr)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
+
+		// Declare svcName here so it's available for both the log filename and the goroutine.
+		svcName := name
+		logFile := filepath.Join(base, fmt.Sprintf("gost-%s.log", svcName))
+		f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			cmd.Stdout = nil
+			cmd.Stderr = nil
+		} else {
+			cmd.Stdout = f
+			cmd.Stderr = f
+		}
 
 		fmt.Printf("  ↳ %s: local %d → SOCKS5 → remote localhost:%d\n", name, lp, remotePort)
 
-		svcName := name
 		go func(c *exec.Cmd) {
 			if err := c.Run(); err != nil {
 				fmt.Printf("  gost exited (%s): %v\n", svcName, err)
