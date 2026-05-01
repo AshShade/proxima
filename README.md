@@ -194,6 +194,37 @@ myapp            7777         17777        ✔ up
 api              3000         13000        ✔ up
 ```
 
+### Manage services (TUI)
+
+```bash
+proxima ui
+```
+
+Opens an interactive terminal UI to manage services without editing config files manually:
+
+```
+╭─ Proxima ──────────────────────────────────────────────╮
+│ Proxima                                                 │
+│ daemon: ✔  caddy: ✔  socks5: ✔                         │
+│                                                         │
+│   SERVICE             REMOTE PORT  TUNNEL               │
+│   ──────────────────────────────────────────            │
+│ ▶ myapp               7777         ✔ up                 │
+│   api                 3000         ✔ up                 │
+│                                                         │
+│   [a]dd  [d]elete  [o]pen  [↑↓] select  [q]uit         │
+╰─────────────────────────────────────────────────────────╯
+```
+
+Keys:
+- `↑↓` or `j/k` — select service
+- `a` — add a new service (prompts for name and port)
+- `d` — delete selected service
+- `o` — open selected service in browser
+- `q` / `Esc` — quit
+
+Adding or deleting a service automatically saves `config.json` and runs `proxima start` in the background.
+
 ### Stop everything
 
 ```bash
