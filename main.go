@@ -51,8 +51,10 @@ func main() {
 		runStatus()
 	case "daemon":
 		runDaemon()
+	case "ui":
+		runUI()
 	default:
-		fmt.Fprintf(os.Stderr, "Usage: proxima [start|stop|status]\n")
+		fmt.Fprintf(os.Stderr, "Usage: proxima [start|stop|status|ui]\n")
 		os.Exit(1)
 	}
 }
