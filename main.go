@@ -121,6 +121,9 @@ func runStart() {
 
 	// Unload first so a re-run of start picks up any config changes.
 	exec.Command("launchctl", "unload", plistPath).Run() //nolint:errcheck
+	// Kill any stray caddy/gost processes left from a previous daemon.
+	exec.Command("pkill", "-9", "-f", "caddy run --config").Run() //nolint:errcheck
+	exec.Command("pkill", "-9", "-f", "gost -L=").Run()           //nolint:errcheck
 	time.Sleep(300 * time.Millisecond)
 
 	out, err := exec.Command("launchctl", "load", plistPath).CombinedOutput()
@@ -467,6 +470,9 @@ func generateCaddyfile(cfg Config) {
 			"https://%s.dev.local {\n"+
 				"\treverse_proxy http://127.0.0.1:%d {\n"+
 				"\t\theader_up Host localhost\n"+
+				"\t\ttransport http {\n"+
+				"\t\t\tversions 1.1\n"+
+				"\t\t}\n"+
 				"\t}\n"+
 				"}\n\n",
 			name, lp,
