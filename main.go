@@ -30,10 +30,10 @@ var (
 	plistPath  = filepath.Join(home, "Library", "LaunchAgents", "com.proxima.plist")
 )
 
-// localPort returns a deterministic local port for a given remote port.
-// local_port = 10000 + remote_port
+// localPort returns the local tunnel port for a given remote port.
+// Uses the same port to avoid issues with services that check port consistency.
 func localPort(remotePort int) int {
-	return 10000 + remotePort
+	return remotePort
 }
 
 func main() {

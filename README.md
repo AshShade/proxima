@@ -22,11 +22,11 @@ Browser
   │
   ▼
 Caddy  (HTTPS termination, port 443)
-  │  reverse_proxy → http://127.0.0.1:17777
+  │  reverse_proxy → http://127.0.0.1:7777
   │  sets header: Host: localhost
   ▼
-gost  (TCP tunnel, port 17777)
-  │  tcp://127.0.0.1:17777/localhost:7777
+gost  (TCP tunnel, port 7777)
+  │  tcp://127.0.0.1:7777/localhost:7777
   │  forwards through SOCKS5
   ▼
 SOCKS5 proxy  (127.0.0.1:1080)
@@ -62,7 +62,7 @@ The generated `~/.proxima/Caddyfile` looks like:
 
 ```caddy
 https://myapp.dev.local {
-    reverse_proxy http://127.0.0.1:17777 {
+    reverse_proxy http://127.0.0.1:7777 {
         header_up Host localhost
     }
 }
@@ -75,25 +75,25 @@ The `header_up Host localhost` line is important: it sets the HTTP `Host` header
 gost creates a raw TCP tunnel between a local port and a remote port, routed through the SOCKS5 proxy. The command it runs is:
 
 ```
-gost -L=tcp://127.0.0.1:17777/localhost:7777 -F=socks5://127.0.0.1:1080
+gost -L=tcp://127.0.0.1:7777/localhost:7777 -F=socks5://127.0.0.1:1080
 ```
 
 Breaking this down:
-- `-L=tcp://127.0.0.1:17777/localhost:7777` — listen on local port `17777`; when a connection arrives, connect to `localhost:7777` on the other side of the proxy
+- `-L=tcp://127.0.0.1:7777/localhost:7777` — listen on local port `7777`; when a connection arrives, connect to `localhost:7777` on the other side of the proxy
 - `-F=socks5://127.0.0.1:1080` — use the SOCKS5 proxy at `127.0.0.1:1080` to make that connection
 
 Crucially, `localhost:7777` is resolved **by the SOCKS5 proxy on the remote machine**, not locally. So it connects to port `7777` on the remote machine's own loopback interface — exactly where the remote service is listening.
 
 **4. Port numbering**
 
-Local ports are assigned deterministically: `local = 10000 + remote`. So:
+Local tunnel ports use the same port number as the remote service. This avoids issues with services that check port consistency between client and server.
 
 | Service | Remote port | Local tunnel port |
 |---------|-------------|-------------------|
-| myapp   | 7777        | 17777             |
-| api     | 3000        | 13000             |
+| myapp   | 7777        | 7777              |
+| api     | 3000        | 3000              |
 
-No port conflicts, no configuration needed.
+No configuration needed. Just make sure the port isn't already in use locally.
 
 **5. Process management — launchd**
 
@@ -190,8 +190,8 @@ socks5: ✔ reachable (127.0.0.1:1080)
 
 SERVICE          REMOTE PORT  LOCAL PORT   TUNNEL
 ────────────────────────────────────────────────────
-myapp            7777         17777        ✔ up
-api              3000         13000        ✔ up
+myapp            7777         7777         ✔ up
+api              3000         3000         ✔ up
 ```
 
 ### Manage services (TUI)
