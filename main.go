@@ -385,6 +385,7 @@ func syncHosts(cfg Config) {
 	block = append(block, blockStart)
 	for name := range cfg.Services {
 		block = append(block, fmt.Sprintf("127.0.0.1 %s.dev.local", name))
+		block = append(block, fmt.Sprintf("::1       %s.dev.local", name))
 	}
 	block = append(block, blockEnd)
 	block = append(block, "")
