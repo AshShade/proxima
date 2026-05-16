@@ -104,7 +104,8 @@ launchd
   └── proxima daemon
         ├── caddy run
         ├── gost (service 1)
-        └── gost (service 2)
+        ├── gost (service 2)
+        └── ssh -N <host>      (optional, see Configuration)
 ```
 
 **6. Log management**
@@ -152,6 +153,40 @@ Create `~/.proxima/config.json`:
 ```
 
 Each key is a service name. The value is the port the service listens on **on the remote machine's localhost**. That's it — no local ports, no hostnames, no other options.
+
+### Optional: let proxima manage the SSH SOCKS5 proxy
+
+By default, proxima expects you to start your own `ssh -D 1080` somewhere. If you'd rather have proxima keep the SSH proxy alive for you (auto-reconnect after laptop sleep, network drops, credential renewals, etc.), add an `ssh_proxy_host`:
+
+```json
+{
+  "services": {
+    "myapp": 7777,
+    "api": 3000
+  },
+  "ssh_proxy_host": "my-proxy-host"
+}
+```
+
+`my-proxy-host` is a Host alias from your `~/.ssh/config`. That host **must** define `DynamicForward 1080`. A minimal entry looks like:
+
+```ssh-config
+Host my-proxy-host
+  HostName your.remote.example.com
+  User you
+  DynamicForward 1080
+  ServerAliveInterval 15
+  ExitOnForwardFailure yes
+```
+
+When set, the daemon will spawn `ssh -N my-proxy-host` and respawn it whenever it exits. ControlMaster is explicitly disabled on this session so it does not collide with any interactive `ssh` sessions you may have to the same host.
+
+Reconnect behavior:
+- SSH keepalive is configured for ~10s death detection (5s × 2 misses).
+- A wall-clock-jump detector kills SSH within ~3s of laptop wake, so you don't have to wait for keepalive on a stale TCP socket.
+- Retries are spaced 2s apart (5s after several rapid failures, to avoid busy-looping when the underlying issue is persistent like wrong credentials).
+
+In practice that means the proxy comes back online within a handful of seconds of network/credential recovery, regardless of *why* it dropped.
 
 ---
 
@@ -251,7 +286,8 @@ Run `proxima start` again any time you:
     ├── daemon.log     # proxima daemon stdout/stderr
     ├── caddy.log      # Caddy logs (truncated hourly)
     ├── gost-myapp.log # per-service gost logs (truncated hourly)
-    └── gost-api.log
+    ├── gost-api.log
+    └── ssh-proxy.log  # only present if ssh_proxy_host is configured
 
 ~/Library/LaunchAgents/
 └── com.proxima.plist  # keeps the daemon running
@@ -284,3 +320,6 @@ Check `~/.proxima/logs/caddy.log` for errors. Port 443 may be in use by another 
 
 **gost exits immediately**
 The SOCKS5 proxy at `127.0.0.1:1080` is not reachable. Make sure your SSH tunnel or proxy is running before starting proxima.
+
+**SOCKS5 keeps showing "not reachable" when proxima is managing the SSH proxy**
+Check `~/.proxima/logs/ssh-proxy.log` for the actual SSH error. Common causes: the `Host` alias in `ssh_proxy_host` is wrong, the host doesn't have `DynamicForward 1080`, or your SSH credentials need to be renewed.

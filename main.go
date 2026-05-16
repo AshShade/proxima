@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -14,9 +15,12 @@ import (
 	"time"
 )
 
-// Config matches exactly: { "services": { "name": port, ... } }
+// Config: { "services": { "name": port, ... }, "ssh_proxy_host": "cd" }
+// ssh_proxy_host is optional. If set, the daemon supervises an ssh -N <host>
+// process that establishes the SOCKS5 proxy via the user's ssh config.
 type Config struct {
-	Services map[string]int `json:"services"`
+	Services     map[string]int `json:"services"`
+	SSHProxyHost string         `json:"ssh_proxy_host,omitempty"`
 }
 
 const socksAddr = "127.0.0.1:1080"
@@ -121,9 +125,11 @@ func runStart() {
 
 	// Unload first so a re-run of start picks up any config changes.
 	exec.Command("launchctl", "unload", plistPath).Run() //nolint:errcheck
-	// Kill any stray caddy/gost processes left from a previous daemon.
+	// Kill any stray caddy/gost/ssh-proxy processes left from a previous daemon.
 	exec.Command("pkill", "-9", "-f", "caddy run --config").Run() //nolint:errcheck
 	exec.Command("pkill", "-9", "-f", "gost -L=").Run()           //nolint:errcheck
+	// The supervised ssh proxy is uniquely identified by `-N -o ControlMaster=no`.
+	exec.Command("pkill", "-9", "-f", "ssh -N -o ControlMaster=no").Run() //nolint:errcheck
 	time.Sleep(300 * time.Millisecond)
 
 	out, err := exec.Command("launchctl", "load", plistPath).CombinedOutput()
@@ -151,8 +157,9 @@ func runStop() {
 		fmt.Println("  ↳ daemon stopped")
 	}
 
-	// Belt-and-suspenders: kill any stray gost processes.
-	exec.Command("pkill", "-9", "-f", "gost -L=").Run() //nolint:errcheck
+	// Belt-and-suspenders: kill any stray gost / ssh-proxy processes.
+	exec.Command("pkill", "-9", "-f", "gost -L=").Run()                  //nolint:errcheck
+	exec.Command("pkill", "-9", "-f", "ssh -N -o ControlMaster=no").Run() //nolint:errcheck
 
 	fmt.Println("→ Cleaning /etc/hosts")
 	removeHostsBlock()
@@ -254,11 +261,16 @@ func runDaemon() {
 		}
 	}
 
+	// Optional: supervise an SSH SOCKS5 proxy process.
+	// Runs in its own goroutine; respawns SSH if it exits.
+	supervisorCtx, cancelSupervisor := context.WithCancel(context.Background())
+
 	// Handle SIGTERM / SIGINT for clean shutdown.
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
 		<-sigs
+		cancelSupervisor()
 		killChildren()
 		os.Exit(0)
 	}()
@@ -269,6 +281,10 @@ func runDaemon() {
 		if cmd := startGostTunnel(name, remotePort); cmd != nil {
 			addChild(cmd)
 		}
+	}
+
+	if cfg.SSHProxyHost != "" {
+		go superviseSSHProxy(supervisorCtx, cfg.SSHProxyHost)
 	}
 
 	// Truncate all log files every hour on the hour.
@@ -293,6 +309,9 @@ func truncateLogs(cfg Config) {
 	names := []string{"caddy"}
 	for name := range cfg.Services {
 		names = append(names, "gost-"+name)
+	}
+	if cfg.SSHProxyHost != "" {
+		names = append(names, "ssh-proxy")
 	}
 	for _, name := range names {
 		path := filepath.Join(logsDir, name+".log")
@@ -347,6 +366,128 @@ func startGostTunnel(name string, remotePort int) *exec.Cmd {
 	}
 	go cmd.Wait() //nolint:errcheck
 	return cmd
+}
+
+// ── ssh proxy supervisor ──────────────────────────────────────────────────────
+
+// superviseSSHProxy runs `ssh -N <host>` to establish a SOCKS5 proxy via the
+// user's ssh config, and respawns it if it exits. It explicitly disables
+// ControlMaster so this proxy session is independent from any interactive ssh
+// session the user may have to the same host.
+//
+// Reconnect philosophy: we don't try to diagnose *why* ssh failed (network
+// down, credentials expired, remote rebooting, ...). We just retry aggressively.
+// The cost of a failed retry is local (~hundreds of ms), so the moment the
+// underlying condition recovers, the next retry succeeds within seconds.
+//
+// The user's ssh config must define DynamicForward on the given Host, e.g.:
+//
+//	Host my-proxy-host
+//	  HostName ...
+//	  DynamicForward 1080
+//	  ServerAliveInterval 15
+//	  ExitOnForwardFailure yes
+//
+// On exit (ctx cancelled), the running ssh process is killed.
+func superviseSSHProxy(ctx context.Context, host string) {
+	const (
+		quickRetry            = 2 * time.Second  // normal retry interval
+		slowRetry             = 5 * time.Second  // after several rapid failures
+		fastFailureThreshold  = 5 * time.Second  // ssh exit within this is "fast"
+		consecutiveFastTrigger = 5               // switch to slowRetry after N fast failures
+	)
+
+	consecutiveFastFailures := 0
+
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		cmd := exec.CommandContext(ctx, "ssh",
+			"-N",
+			"-o", "ControlMaster=no",
+			"-o", "ControlPath=none",
+			"-o", "ServerAliveInterval=5",
+			"-o", "ServerAliveCountMax=2",
+			"-o", "ExitOnForwardFailure=yes",
+			"-o", "StreamLocalBindUnlink=yes",
+			host,
+		)
+		if f := openLog("ssh-proxy"); f != nil {
+			cmd.Stdout = f
+			cmd.Stderr = f
+		}
+
+		startedAt := time.Now()
+		if err := cmd.Start(); err != nil {
+			fmt.Fprintf(os.Stderr, "ssh proxy start failed: %v\n", err)
+		} else {
+			// Wake-from-sleep detector: if wall-clock jumps significantly
+			// between ticks, the laptop was asleep — kill ssh now so we
+			// reconnect immediately instead of waiting for SSH keepalive
+			// to time out.
+			detectorCtx, cancelDetector := context.WithCancel(ctx)
+			go watchForSleep(detectorCtx, cmd.Process)
+
+			cmd.Wait() //nolint:errcheck
+			cancelDetector()
+		}
+
+		if ctx.Err() != nil {
+			return
+		}
+
+		// Track consecutive fast failures. Avoids busy-looping when ssh
+		// keeps exiting in <5s (e.g., wrong host alias, persistent auth
+		// failure), but stays snappy under transient blips.
+		if time.Since(startedAt) < fastFailureThreshold {
+			consecutiveFastFailures++
+		} else {
+			consecutiveFastFailures = 0
+		}
+
+		delay := quickRetry
+		if consecutiveFastFailures >= consecutiveFastTrigger {
+			delay = slowRetry
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+	}
+}
+
+// watchForSleep polls every 3s and kills the given process if the wall clock
+// jumps by more than ~10s between ticks (system was likely asleep). Stripping
+// the monotonic component with .Round(0) ensures we measure real wall time
+// even on platforms where the monotonic clock pauses during sleep.
+func watchForSleep(ctx context.Context, p *os.Process) {
+	const tick = 3 * time.Second
+	const jumpThreshold = 10 * time.Second
+
+	last := time.Now().Round(0)
+	ticker := time.NewTicker(tick)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case t := <-ticker.C:
+			wall := t.Round(0)
+			if wall.Sub(last) > jumpThreshold {
+				// Wake from sleep detected.
+				if p != nil {
+					p.Kill() //nolint:errcheck
+				}
+				return
+			}
+			last = wall
+		}
+	}
 }
 
 // ── /etc/hosts ────────────────────────────────────────────────────────────────
@@ -524,7 +665,8 @@ func exampleConfig() string {
   "services": {
     "myapp": 7777,
     "api": 3000
-  }
+  },
+  "ssh_proxy_host": "my-proxy-host"
 }`
 }
 
