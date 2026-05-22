@@ -357,11 +357,17 @@ func statusLine(label string, up bool) string {
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 // saveAndRestart writes config.json and runs proxima start in the background.
+// It preserves any non-services fields already in the config (e.g.
+// ssh_proxy_host) by reading the existing file first and only overwriting
+// the services map.
 func saveAndRestart(services []serviceEntry) {
-	cfg := Config{Services: make(map[string]int)}
+	cfg, _ := tryLoadConfig() // ignore error: empty/missing config means we start fresh
+
+	cfg.Services = make(map[string]int)
 	for _, s := range services {
 		cfg.Services[s.name] = s.port
 	}
+
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return
