@@ -15,7 +15,21 @@ import (
 	"time"
 )
 
-// Config: { "services": { "name": port, ... }, "ssh_proxy_host": "cd" }
+// Config: { "services": { "domain": port, ... }, "ssh_proxy_host": "..." }
+//
+// Each key in services is the full domain at which the service should be
+// exposed locally over HTTPS. For example:
+//
+//	"services": {
+//	  "myapp.dev.local":     7777,
+//	  "dev.api.example.com": 8080
+//	}
+//
+// proxima hijacks each domain to 127.0.0.1 via /etc/hosts and serves it
+// through Caddy with a locally-trusted self-signed cert (Caddy's internal
+// CA), regardless of the TLD. The domain does not (and probably should
+// not) resolve publicly.
+//
 // ssh_proxy_host is optional. If set, the daemon supervises an ssh -N <host>
 // process that establishes the SOCKS5 proxy via the user's ssh config.
 type Config struct {
@@ -204,16 +218,27 @@ func runStatus() {
 		return
 	}
 
+	// Width "SERVICE" column to fit the longest domain (min 12, max 40).
+	domainWidth := len("DOMAIN")
+	for domain := range cfg.Services {
+		if l := len(domain); l > domainWidth {
+			domainWidth = l
+		}
+	}
+	if domainWidth > 40 {
+		domainWidth = 40
+	}
+
 	fmt.Println()
-	fmt.Printf("%-16s %-12s %-12s %s\n", "SERVICE", "REMOTE PORT", "LOCAL PORT", "TUNNEL")
-	fmt.Println(strings.Repeat("─", 52))
-	for name, remotePort := range cfg.Services {
+	fmt.Printf("%-*s %-12s %-12s %s\n", domainWidth, "DOMAIN", "REMOTE PORT", "LOCAL PORT", "TUNNEL")
+	fmt.Println(strings.Repeat("─", domainWidth+12+12+8))
+	for domain, remotePort := range cfg.Services {
 		lp := localPort(remotePort)
 		status := "✔ up"
 		if !tcpReachable(fmt.Sprintf("127.0.0.1:%d", lp)) {
 			status = "✗ down"
 		}
-		fmt.Printf("%-16s %-12d %-12d %s\n", name, remotePort, lp, status)
+		fmt.Printf("%-*s %-12d %-12d %s\n", domainWidth, domain, remotePort, lp, status)
 	}
 }
 
@@ -277,8 +302,8 @@ func runDaemon() {
 
 	// Start caddy and gost tunnels.
 	addChild(startCaddy())
-	for name, remotePort := range cfg.Services {
-		if cmd := startGostTunnel(name, remotePort); cmd != nil {
+	for domain, remotePort := range cfg.Services {
+		if cmd := startGostTunnel(domain, remotePort); cmd != nil {
 			addChild(cmd)
 		}
 	}
@@ -307,8 +332,8 @@ func runDaemon() {
 // Child processes keep their file handles open and continue writing from byte 0.
 func truncateLogs(cfg Config) {
 	names := []string{"caddy"}
-	for name := range cfg.Services {
-		names = append(names, "gost-"+name)
+	for domain := range cfg.Services {
+		names = append(names, "gost-"+domain)
 	}
 	if cfg.SSHProxyHost != "" {
 		names = append(names, "ssh-proxy")
@@ -350,18 +375,21 @@ func startCaddy() *exec.Cmd {
 }
 
 // startGostTunnel spawns a single gost TCP tunnel as a child process.
-func startGostTunnel(name string, remotePort int) *exec.Cmd {
+// startGostTunnel spawns a single gost TCP tunnel as a child process.
+// The domain is used only for naming the log file; gost itself listens
+// on 127.0.0.1:<remotePort> regardless of domain.
+func startGostTunnel(domain string, remotePort int) *exec.Cmd {
 	lp := localPort(remotePort)
 	listenAddr := fmt.Sprintf("tcp://127.0.0.1:%d/localhost:%d", lp, remotePort)
 	forwardAddr := fmt.Sprintf("socks5://%s", socksAddr)
 
 	cmd := exec.Command("gost", "-L="+listenAddr, "-F="+forwardAddr)
-	if f := openLog("gost-" + name); f != nil {
+	if f := openLog("gost-" + domain); f != nil {
 		cmd.Stdout = f
 		cmd.Stderr = f
 	}
 	if err := cmd.Start(); err != nil {
-		fmt.Fprintf(os.Stderr, "gost start failed (%s): %v\n", name, err)
+		fmt.Fprintf(os.Stderr, "gost start failed (%s): %v\n", domain, err)
 		return nil
 	}
 	go cmd.Wait() //nolint:errcheck
@@ -524,9 +552,9 @@ func syncHosts(cfg Config) {
 	var block []string
 	block = append(block, "")
 	block = append(block, blockStart)
-	for name := range cfg.Services {
-		block = append(block, fmt.Sprintf("127.0.0.1 %s.dev.local", name))
-		block = append(block, fmt.Sprintf("::1       %s.dev.local", name))
+	for domain := range cfg.Services {
+		block = append(block, fmt.Sprintf("127.0.0.1 %s", domain))
+		block = append(block, fmt.Sprintf("::1       %s", domain))
 	}
 	block = append(block, blockEnd)
 	block = append(block, "")
@@ -606,10 +634,13 @@ func generateCaddyfile(cfg Config) {
 		filepath.Join(logsDir, "caddy.log"),
 	))
 
-	for name, remotePort := range cfg.Services {
+	for domain, remotePort := range cfg.Services {
 		lp := localPort(remotePort)
+		// `tls internal` forces Caddy's local CA even for domains that look
+		// public (e.g. *.example.com), preventing it from attempting ACME.
 		sb.WriteString(fmt.Sprintf(
-			"https://%s.dev.local {\n"+
+			"https://%s {\n"+
+				"\ttls internal\n"+
 				"\treverse_proxy http://127.0.0.1:%d {\n"+
 				"\t\theader_up Host localhost\n"+
 				"\t\ttransport http {\n"+
@@ -617,7 +648,7 @@ func generateCaddyfile(cfg Config) {
 				"\t\t}\n"+
 				"\t}\n"+
 				"}\n\n",
-			name, lp,
+			domain, lp,
 		))
 	}
 
@@ -663,8 +694,8 @@ func tryLoadConfig() (Config, error) {
 func exampleConfig() string {
 	return `{
   "services": {
-    "myapp": 7777,
-    "api": 3000
+    "myapp.dev.local": 7777,
+    "api.dev.local": 3000
   },
   "ssh_proxy_host": "my-proxy-host"
 }`

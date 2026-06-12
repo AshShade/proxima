@@ -56,19 +56,22 @@ This makes `myapp.dev.local` point to your own machine (`127.0.0.1`), where Cadd
 
 **2. HTTPS termination — Caddy**
 
-Caddy listens on port 443 and handles TLS automatically (self-signed cert for `.dev.local`). It receives the browser's HTTPS request and forwards it as plain HTTP to a local port where gost is listening.
+Caddy listens on port 443 and handles TLS automatically using its built-in local CA, so it works for any domain (`.dev.local`, `.com`, `.test`, whatever you put in the config). It receives the browser's HTTPS request and forwards it as plain HTTP to a local port where gost is listening.
 
 The generated `~/.proxima/Caddyfile` looks like:
 
 ```caddy
 https://myapp.dev.local {
+    tls internal
     reverse_proxy http://127.0.0.1:7777 {
         header_up Host localhost
     }
 }
 ```
 
-The `header_up Host localhost` line is important: it sets the HTTP `Host` header to `localhost` before forwarding. Without this, the remote service would receive `Host: myapp.dev.local`, which it doesn't know about and would reject.
+`tls internal` pins Caddy to its own local CA. Without it, Caddy would try to fetch a real cert via ACME for any domain that looks public (e.g. `.com`), which would fail offline and leak your domain to the public CA logs.
+
+The `header_up Host localhost` line sets the HTTP `Host` header to `localhost` before forwarding. Without this, the remote service would receive `Host: myapp.dev.local`, which it doesn't know about and would reject.
 
 **3. TCP tunnel — gost**
 
@@ -88,10 +91,10 @@ Crucially, `localhost:7777` is resolved **by the SOCKS5 proxy on the remote mach
 
 Local tunnel ports use the same port number as the remote service. This avoids issues with services that check port consistency between client and server.
 
-| Service | Remote port | Local tunnel port |
-|---------|-------------|-------------------|
-| myapp   | 7777        | 7777              |
-| api     | 3000        | 3000              |
+| Domain               | Remote port | Local tunnel port |
+|----------------------|-------------|-------------------|
+| myapp.dev.local      | 7777        | 7777              |
+| api.dev.local        | 3000        | 3000              |
 
 No configuration needed. Just make sure the port isn't already in use locally.
 
@@ -103,8 +106,7 @@ No configuration needed. Just make sure the port isn't already in use locally.
 launchd
   └── proxima daemon
         ├── caddy run
-        ├── gost (service 1)
-        ├── gost (service 2)
+        ├── gost (one per service)
         └── ssh -N <host>      (optional, see Configuration)
 ```
 
@@ -146,13 +148,26 @@ Create `~/.proxima/config.json`:
 ```json
 {
   "services": {
-    "myapp": 7777,
-    "api": 3000
+    "myapp.dev.local": 7777,
+    "api.dev.local": 3000
   }
 }
 ```
 
-Each key is a service name. The value is the port the service listens on **on the remote machine's localhost**. That's it — no local ports, no hostnames, no other options.
+Each key is the **full domain** at which the service should be exposed locally. The value is the port the service listens on **on the remote machine's localhost**.
+
+Domains can be anything you want. proxima hijacks them locally via `/etc/hosts` and serves them through Caddy with a locally-trusted self-signed cert (Caddy's internal CA), so the TLD doesn't matter:
+
+```json
+{
+  "services": {
+    "myapp.dev.local":     7777,
+    "dev.api.example.com": 8080
+  }
+}
+```
+
+Both domains will work locally with HTTPS. The custom domain is still resolved to `127.0.0.1` via `/etc/hosts` — it does not (and probably should not) resolve publicly. Run `caddy trust` once to add Caddy's root CA to your keychain so the browser accepts the certs.
 
 ### Optional: let proxima manage the SSH SOCKS5 proxy
 
@@ -161,8 +176,8 @@ By default, proxima expects you to start your own `ssh -D 1080` somewhere. If yo
 ```json
 {
   "services": {
-    "myapp": 7777,
-    "api": 3000
+    "myapp.dev.local": 7777,
+    "api.dev.local": 3000
   },
   "ssh_proxy_host": "my-proxy-host"
 }
@@ -223,10 +238,10 @@ daemon: ✔ running (launchd)
 caddy:  ✔ running
 socks5: ✔ reachable (127.0.0.1:1080)
 
-SERVICE          REMOTE PORT  LOCAL PORT   TUNNEL
+DOMAIN              REMOTE PORT  LOCAL PORT   TUNNEL
 ────────────────────────────────────────────────────
-myapp            7777         7777         ✔ up
-api              3000         3000         ✔ up
+api.dev.local       3000         3000         ✔ up
+myapp.dev.local     7777         7777         ✔ up
 ```
 
 ### Manage services (TUI)
@@ -242,10 +257,10 @@ Opens an interactive terminal UI to manage services without editing config files
 │ Proxima                                                 │
 │ daemon: ✔  caddy: ✔  socks5: ✔                         │
 │                                                         │
-│   SERVICE             REMOTE PORT  TUNNEL               │
+│   DOMAIN              REMOTE PORT  TUNNEL               │
 │   ──────────────────────────────────────────            │
-│ ▶ myapp               7777         ✔ up                 │
-│   api                 3000         ✔ up                 │
+│ ▶ myapp.dev.local     7777         ✔ up                 │
+│   api.dev.local       3000         ✔ up                 │
 │                                                         │
 │   [a]dd  [d]elete  [o]pen  [↑↓] select  [q]uit         │
 ╰─────────────────────────────────────────────────────────╯
@@ -253,7 +268,7 @@ Opens an interactive terminal UI to manage services without editing config files
 
 Keys:
 - `↑↓` or `j/k` — select service
-- `a` — add a new service (prompts for name and port)
+- `a` — add a new service. Prompts for a domain (bare names like `foo` are auto-completed to `foo.dev.local`; anything containing a dot is used as-is) and a remote port
 - `d` — delete selected service
 - `o` — open selected service in browser
 - `q` / `Esc` — quit
@@ -280,17 +295,17 @@ Run `proxima start` again any time you:
 
 ```
 ~/.proxima/
-├── config.json        # your service definitions
-├── Caddyfile          # generated on each start
+├── config.json                # your service definitions
+├── Caddyfile                  # generated on each start
 └── logs/
-    ├── daemon.log     # proxima daemon stdout/stderr
-    ├── caddy.log      # Caddy logs (truncated hourly)
-    ├── gost-myapp.log # per-service gost logs (truncated hourly)
-    ├── gost-api.log
-    └── ssh-proxy.log  # only present if ssh_proxy_host is configured
+    ├── daemon.log             # proxima daemon stdout/stderr
+    ├── caddy.log              # Caddy logs (truncated hourly)
+    ├── gost-myapp.dev.local.log  # per-service gost logs (truncated hourly)
+    ├── gost-api.dev.local.log
+    └── ssh-proxy.log          # only present if ssh_proxy_host is configured
 
 ~/Library/LaunchAgents/
-└── com.proxima.plist  # keeps the daemon running
+└── com.proxima.plist          # keeps the daemon running
 ```
 
 ---
@@ -313,7 +328,7 @@ your_username ALL=(ALL) NOPASSWD: /bin/cp /tmp/hosts.proxima /etc/hosts
 ```
 
 **Tunnels show "down" in status**
-Check `~/.proxima/logs/gost-<name>.log` for errors. The most common cause is the SOCKS5 proxy not being reachable.
+Check `~/.proxima/logs/gost-<domain>.log` for errors. The most common cause is the SOCKS5 proxy not being reachable.
 
 **Caddy won't start**
 Check `~/.proxima/logs/caddy.log` for errors. Port 443 may be in use by another process (`sudo lsof -i :443`).

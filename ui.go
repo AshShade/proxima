@@ -51,7 +51,7 @@ type uiMode int
 
 const (
 	modeList uiMode = iota
-	modeAddName
+	modeAddDomain
 	modeAddPort
 	modeConfirmDelete
 )
@@ -60,25 +60,38 @@ type statusInfo struct {
 	daemonUp bool
 	caddyUp  bool
 	socksUp  bool
-	tunnels  map[string]bool // name → up
+	tunnels  map[string]bool // domain → up
 }
 
 type serviceEntry struct {
-	name string
-	port int
+	domain string
+	port   int
 }
 
 type model struct {
 	mode     uiMode
-	services []serviceEntry // sorted by name
+	services []serviceEntry // sorted by domain
 	cursor   int
 
 	// add flow
-	inputName string
-	inputPort string
-	inputErr  string
+	inputDomain string
+	inputPort   string
+	inputErr    string
 
 	status statusInfo
+}
+
+// normalizeDomain returns the input as a full domain. Bare names (no dot)
+// are auto-completed to <name>.dev.local.
+func normalizeDomain(input string) string {
+	d := strings.TrimSpace(input)
+	if d == "" {
+		return ""
+	}
+	if !strings.Contains(d, ".") {
+		return d + ".dev.local"
+	}
+	return d
 }
 
 type tickMsg time.Time
@@ -97,7 +110,7 @@ func fetchStatus(services []serviceEntry) statusInfo {
 		tunnels:  make(map[string]bool),
 	}
 	for _, svc := range services {
-		s.tunnels[svc.name] = tcpReachable(fmt.Sprintf("127.0.0.1:%d", localPort(svc.port)))
+		s.tunnels[svc.domain] = tcpReachable(fmt.Sprintf("127.0.0.1:%d", localPort(svc.port)))
 	}
 	return s
 }
@@ -121,11 +134,11 @@ func initialModel() model {
 
 func configToEntries(cfg Config) []serviceEntry {
 	var entries []serviceEntry
-	for name, port := range cfg.Services {
-		entries = append(entries, serviceEntry{name, port})
+	for domain, port := range cfg.Services {
+		entries = append(entries, serviceEntry{domain, port})
 	}
 	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].name < entries[j].name
+		return entries[i].domain < entries[j].domain
 	})
 	return entries
 }
@@ -150,8 +163,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch m.mode {
 		case modeList:
 			return m.updateList(msg)
-		case modeAddName:
-			return m.updateAddName(msg)
+		case modeAddDomain:
+			return m.updateAddDomain(msg)
 		case modeAddPort:
 			return m.updateAddPort(msg)
 		case modeConfirmDelete:
@@ -177,8 +190,8 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case "a":
-		m.mode = modeAddName
-		m.inputName = ""
+		m.mode = modeAddDomain
+		m.inputDomain = ""
 		m.inputPort = ""
 		m.inputErr = ""
 
@@ -190,39 +203,42 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "o":
 		if len(m.services) > 0 {
 			svc := m.services[m.cursor]
-			url := fmt.Sprintf("https://%s.dev.local", svc.name)
+			url := fmt.Sprintf("https://%s", svc.domain)
 			exec.Command("open", url).Start() //nolint:errcheck
 		}
 	}
 	return m, nil
 }
 
-func (m model) updateAddName(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m model) updateAddDomain(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
 		m.mode = modeList
 	case "enter":
-		name := strings.TrimSpace(m.inputName)
-		if name == "" {
-			m.inputErr = "name cannot be empty"
+		domain := normalizeDomain(m.inputDomain)
+		if domain == "" {
+			m.inputErr = "domain cannot be empty"
 			return m, nil
 		}
 		// Check duplicate.
 		for _, s := range m.services {
-			if s.name == name {
-				m.inputErr = fmt.Sprintf("'%s' already exists", name)
+			if s.domain == domain {
+				m.inputErr = fmt.Sprintf("'%s' already exists", domain)
 				return m, nil
 			}
 		}
+		// Replace the input with the normalized form so the user sees what
+		// they actually committed (and the next screen renders the right name).
+		m.inputDomain = domain
 		m.inputErr = ""
 		m.mode = modeAddPort
 	case "backspace":
-		if len(m.inputName) > 0 {
-			m.inputName = m.inputName[:len(m.inputName)-1]
+		if len(m.inputDomain) > 0 {
+			m.inputDomain = m.inputDomain[:len(m.inputDomain)-1]
 		}
 	default:
 		if len(msg.String()) == 1 {
-			m.inputName += msg.String()
+			m.inputDomain += msg.String()
 		}
 	}
 	return m, nil
@@ -231,7 +247,7 @@ func (m model) updateAddName(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m model) updateAddPort(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
-		m.mode = modeAddName
+		m.mode = modeAddDomain
 	case "enter":
 		port, err := strconv.Atoi(strings.TrimSpace(m.inputPort))
 		if err != nil || port < 1 || port > 65535 {
@@ -239,9 +255,9 @@ func (m model) updateAddPort(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		// Save and restart.
-		m.services = append(m.services, serviceEntry{m.inputName, port})
+		m.services = append(m.services, serviceEntry{m.inputDomain, port})
 		sort.Slice(m.services, func(i, j int) bool {
-			return m.services[i].name < m.services[j].name
+			return m.services[i].domain < m.services[j].domain
 		})
 		m.cursor = 0
 		m.mode = modeList
@@ -291,12 +307,26 @@ func (m model) View() string {
 	if len(m.services) == 0 {
 		b.WriteString(styleDim.Render("  no services — press [a] to add one") + "\n")
 	} else {
-		header := fmt.Sprintf("  %-18s %-12s %s", "SERVICE", "REMOTE PORT", "TUNNEL")
+		// Width DOMAIN column to fit the longest entry (min 18, max 40).
+		domainWidth := len("DOMAIN")
+		for _, svc := range m.services {
+			if l := len(svc.domain); l > domainWidth {
+				domainWidth = l
+			}
+		}
+		if domainWidth < 18 {
+			domainWidth = 18
+		}
+		if domainWidth > 40 {
+			domainWidth = 40
+		}
+
+		header := fmt.Sprintf("  %-*s %-12s %s", domainWidth, "DOMAIN", "REMOTE PORT", "TUNNEL")
 		b.WriteString(styleDim.Render(header) + "\n")
-		b.WriteString(styleDim.Render("  " + strings.Repeat("─", 42)) + "\n")
+		b.WriteString(styleDim.Render("  "+strings.Repeat("─", domainWidth+24)) + "\n")
 
 		for i, svc := range m.services {
-			tunnelUp := m.status.tunnels[svc.name]
+			tunnelUp := m.status.tunnels[svc.domain]
 			tunnel := styleGood.Render("✔ up")
 			if !tunnelUp {
 				tunnel = styleBad.Render("✗ down")
@@ -307,7 +337,7 @@ func (m model) View() string {
 				cursor = styleSelected.Render("▶ ")
 			}
 
-			line := fmt.Sprintf("%s%-18s %-12d %s", cursor, svc.name, svc.port, tunnel)
+			line := fmt.Sprintf("%s%-*s %-12d %s", cursor, domainWidth, svc.domain, svc.port, tunnel)
 			if i == m.cursor {
 				b.WriteString(styleSelected.Render(line) + "\n")
 			} else {
@@ -320,14 +350,14 @@ func (m model) View() string {
 
 	// Modal overlays.
 	switch m.mode {
-	case modeAddName:
-		b.WriteString(m.renderInput("Add service — name:", m.inputName))
+	case modeAddDomain:
+		b.WriteString(m.renderInput("Add service — domain (bare names get .dev.local appended):", m.inputDomain))
 	case modeAddPort:
-		b.WriteString(m.renderInput(fmt.Sprintf("Add '%s' — remote port:", m.inputName), m.inputPort))
+		b.WriteString(m.renderInput(fmt.Sprintf("Add '%s' — remote port:", m.inputDomain), m.inputPort))
 	case modeConfirmDelete:
 		if len(m.services) > 0 {
 			svc := m.services[m.cursor]
-			b.WriteString(styleBad.Render(fmt.Sprintf("  Delete '%s' (port %d)? [y/n]", svc.name, svc.port)) + "\n")
+			b.WriteString(styleBad.Render(fmt.Sprintf("  Delete '%s' (port %d)? [y/n]", svc.domain, svc.port)) + "\n")
 		}
 	default:
 		b.WriteString(styleHelp.Render("  [a]dd  [d]elete  [o]pen  [↑↓] select  [q]uit") + "\n")
@@ -365,7 +395,7 @@ func saveAndRestart(services []serviceEntry) {
 
 	cfg.Services = make(map[string]int)
 	for _, s := range services {
-		cfg.Services[s.name] = s.port
+		cfg.Services[s.domain] = s.port
 	}
 
 	data, err := json.MarshalIndent(cfg, "", "  ")
