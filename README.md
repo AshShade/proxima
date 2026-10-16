@@ -1,149 +1,63 @@
 # proxima
 
-A local HTTPS gateway for remote services reachable only through a SOCKS5 proxy.
+**Open services running on a remote machine's `localhost` as real HTTPS domains in your local browser.**
 
-## The problem it solves
+![platform](https://img.shields.io/badge/platform-macOS-lightgrey)
+![go](https://img.shields.io/badge/go-1.24%2B-00ADD8)
 
-You have a remote machine. On that machine, services are running on `localhost` — ports like `7777`, `3000`, etc. Those services are not exposed to the internet. The only way to reach the remote machine is through a **SOCKS5 proxy** running on your local machine at `127.0.0.1:1080` (e.g. established by an SSH connection with `-D 1080`).
+```console
+$ cat ~/.proxima/config.json
+{ "services": { "myapp.dev.local": 7777 } }
 
-You want to open `https://myapp.dev.local` in your browser and have it just work — with HTTPS, no port numbers in the URL, no manual tunnels to set up each time.
+$ proxima start
+== Proxima: starting ==
+→ Syncing /etc/hosts
+→ Generating Caddyfile
+→ Registering with launchd
+✔ Done — proxima daemon started via launchd
 
-`proxima` automates the entire chain.
-
----
-
-## How it works
-
-```
-Browser
-  │  https://myapp.dev.local
-  ▼
-/etc/hosts  →  resolves myapp.dev.local to 127.0.0.1
-  │
-  ▼
-Caddy  (HTTPS termination, port 443)
-  │  reverse_proxy → http://127.0.0.1:7777
-  │  sets header: Host: localhost
-  ▼
-gost  (TCP tunnel, port 7777)
-  │  tcp://127.0.0.1:7777/localhost:7777
-  │  forwards through SOCKS5
-  ▼
-SOCKS5 proxy  (127.0.0.1:1080)
-  │
-  ▼  [network boundary]
-  │
-Remote machine
-  │  connects to localhost:7777
-  ▼
-Remote service
+$ open https://myapp.dev.local     # served by port 7777 on the remote machine
 ```
 
-### Step by step
+You develop on a remote box (a cloud VM, a dev server) and the only way in is SSH. Your app listens on `localhost:7777` over there. Normally you juggle `ssh -L` port forwards and visit `http://localhost:7777`, which breaks anything that needs HTTPS, a real hostname, or cookies scoped to a domain.
 
-**1. DNS — `/etc/hosts`**
+proxima maps a domain you pick to that remote port. It wires up `/etc/hosts`, a local HTTPS reverse proxy, and a TCP tunnel through your SOCKS5 proxy, then keeps all of it running in the background.
 
-Browsers need a hostname to resolve to an IP. `proxima` adds a block to `/etc/hosts`:
+## Features
 
-```
->>> proxima start
-127.0.0.1 myapp.dev.local
-127.0.0.1 api.dev.local
-<<< proxima end
-```
+- **Real HTTPS on any domain.** `myapp.dev.local`, `dev.api.example.com`, whatever you like. Certificates come from Caddy's local CA, so nothing touches a public CA.
+- **One config file.** Map each domain to a remote port in `~/.proxima/config.json`. No per-service tunnel commands.
+- **Runs in the background.** A launchd agent starts at login and restarts the daemon if it dies.
+- **Optional SSH proxy supervision.** proxima can own the `ssh` SOCKS5 session and reconnect it within seconds after sleep, Wi-Fi changes, or expired credentials.
+- **Terminal UI.** `proxima ui` shows live status and lets you add, delete, and open services.
+- **Bounded logs.** Per-process log files, truncated every hour.
 
-This makes `myapp.dev.local` point to your own machine (`127.0.0.1`), where Caddy is listening.
+## Requirements
 
-**2. HTTPS termination — Caddy**
+- macOS (proxima uses launchd, `/etc/hosts`, and `open`)
+- [Caddy](https://caddyserver.com): `brew install caddy`
+- [gost v3](https://github.com/go-gost/gost): `brew install gost`
+- [Go 1.24+](https://go.dev/dl/) to build
+- A SOCKS5 proxy at `127.0.0.1:1080` into the remote machine. Either run one yourself (`ssh -D 1080 you@remote`) or [let proxima manage it](#let-proxima-manage-the-ssh-proxy).
 
-Caddy listens on port 443 and handles TLS automatically using its built-in local CA, so it works for any domain (`.dev.local`, `.com`, `.test`, whatever you put in the config). It receives the browser's HTTPS request and forwards it as plain HTTP to a local port where gost is listening.
-
-The generated `~/.proxima/Caddyfile` looks like:
-
-```caddy
-https://myapp.dev.local {
-    tls internal
-    reverse_proxy http://127.0.0.1:7777 {
-        header_up Host localhost
-    }
-}
-```
-
-`tls internal` pins Caddy to its own local CA. Without it, Caddy would try to fetch a real cert via ACME for any domain that looks public (e.g. `.com`), which would fail offline and leak your domain to the public CA logs.
-
-The `header_up Host localhost` line sets the HTTP `Host` header to `localhost` before forwarding. Without this, the remote service would receive `Host: myapp.dev.local`, which it doesn't know about and would reject.
-
-**3. TCP tunnel — gost**
-
-gost creates a raw TCP tunnel between a local port and a remote port, routed through the SOCKS5 proxy. The command it runs is:
-
-```
-gost -L=tcp://127.0.0.1:7777/localhost:7777 -F=socks5://127.0.0.1:1080
-```
-
-Breaking this down:
-- `-L=tcp://127.0.0.1:7777/localhost:7777` — listen on local port `7777`; when a connection arrives, connect to `localhost:7777` on the other side of the proxy
-- `-F=socks5://127.0.0.1:1080` — use the SOCKS5 proxy at `127.0.0.1:1080` to make that connection
-
-Crucially, `localhost:7777` is resolved **by the SOCKS5 proxy on the remote machine**, not locally. So it connects to port `7777` on the remote machine's own loopback interface — exactly where the remote service is listening.
-
-**4. Port numbering**
-
-Local tunnel ports use the same port number as the remote service. This avoids issues with services that check port consistency between client and server.
-
-| Domain               | Remote port | Local tunnel port |
-|----------------------|-------------|-------------------|
-| myapp.dev.local      | 7777        | 7777              |
-| api.dev.local        | 3000        | 3000              |
-
-No configuration needed. Just make sure the port isn't already in use locally.
-
-**5. Process management — launchd**
-
-`proxima` registers itself as a launchd agent (`com.proxima`). launchd starts the `proxima daemon` process at login and keeps it alive. The daemon owns Caddy and all gost tunnels as child processes — when the daemon stops, everything stops with it.
-
-```
-launchd
-  └── proxima daemon
-        ├── caddy run
-        ├── gost (one per service)
-        └── ssh -N <host>      (optional, see Configuration)
-```
-
-**6. Log management**
-
-All logs go to `~/.proxima/logs/`. The daemon truncates every log file to zero bytes on the hour, so they never grow unbounded. The logs directory is wiped and recreated fresh on each `proxima start`.
-
----
-
-## Prerequisites
-
-- **gost v3** — `brew install gost` or download from [github.com/go-gost/gost](https://github.com/go-gost/gost)
-- **Caddy** — `brew install caddy`
-- **Go 1.21+** — only needed to build; the resulting binary has no runtime dependencies
-- A **SOCKS5 proxy** running at `127.0.0.1:1080` (e.g. `ssh -D 1080 user@remote-host`)
-
----
-
-## Installation
+## Install
 
 ```bash
-git clone https://github.com/AshShade/proxima
+git clone https://github.com/AshShade/proxima.git
 cd proxima
 go build -o proxima .
+sudo mv proxima /usr/local/bin/
 ```
 
-Move the binary somewhere on your PATH if you want to run it from anywhere:
+## Quick start
+
+**1. Trust Caddy's local CA** (once per machine) so browsers accept the certificates:
 
 ```bash
-mv proxima /usr/local/bin/proxima
+caddy trust
 ```
 
----
-
-## Configuration
-
-Create `~/.proxima/config.json`:
+**2. Describe your services** in `~/.proxima/config.json`. Each key is the domain you want locally; each value is the port the service listens on, on the remote machine's `localhost`:
 
 ```json
 {
@@ -154,83 +68,30 @@ Create `~/.proxima/config.json`:
 }
 ```
 
-Each key is the **full domain** at which the service should be exposed locally. The value is the port the service listens on **on the remote machine's localhost**.
+**3. Start your SOCKS5 proxy** (skip this if you set [`ssh_proxy_host`](#let-proxima-manage-the-ssh-proxy)):
 
-Domains can be anything you want. proxima hijacks them locally via `/etc/hosts` and serves them through Caddy with a locally-trusted self-signed cert (Caddy's internal CA), so the TLD doesn't matter:
-
-```json
-{
-  "services": {
-    "myapp.dev.local":     7777,
-    "dev.api.example.com": 8080
-  }
-}
+```bash
+ssh -N -D 1080 you@remote-host
 ```
 
-Both domains will work locally with HTTPS. The custom domain is still resolved to `127.0.0.1` via `/etc/hosts` — it does not (and probably should not) resolve publicly. Run `caddy trust` once to add Caddy's root CA to your keychain so the browser accepts the certs.
-
-### Optional: let proxima manage the SSH SOCKS5 proxy
-
-By default, proxima expects you to start your own `ssh -D 1080` somewhere. If you'd rather have proxima keep the SSH proxy alive for you (auto-reconnect after laptop sleep, network drops, credential renewals, etc.), add an `ssh_proxy_host`:
-
-```json
-{
-  "services": {
-    "myapp.dev.local": 7777,
-    "api.dev.local": 3000
-  },
-  "ssh_proxy_host": "my-proxy-host"
-}
-```
-
-`my-proxy-host` is a Host alias from your `~/.ssh/config`. That host **must** define `DynamicForward 1080`. A minimal entry looks like:
-
-```ssh-config
-Host my-proxy-host
-  HostName your.remote.example.com
-  User you
-  DynamicForward 1080
-  ServerAliveInterval 15
-  ExitOnForwardFailure yes
-```
-
-When set, the daemon will spawn `ssh -N my-proxy-host` and respawn it whenever it exits. ControlMaster is explicitly disabled on this session so it does not collide with any interactive `ssh` sessions you may have to the same host.
-
-Reconnect behavior:
-- SSH keepalive is configured for ~10s death detection (5s × 2 misses).
-- A wall-clock-jump detector kills SSH within ~3s of laptop wake, so you don't have to wait for keepalive on a stale TCP socket.
-- Retries are spaced 2s apart (5s after several rapid failures, to avoid busy-looping when the underlying issue is persistent like wrong credentials).
-
-In practice that means the proxy comes back online within a handful of seconds of network/credential recovery, regardless of *why* it dropped.
-
----
-
-## Usage
-
-Make sure your SOCKS5 proxy is running first, then:
+**4. Start proxima:**
 
 ```bash
 proxima start
 ```
 
-On first run it will ask for your password once (to write `/etc/hosts` via `sudo`). After that, open your browser:
+`sudo` asks for your password to update `/etc/hosts`. The command returns right away and the daemon keeps running under launchd. Open `https://myapp.dev.local`.
 
-```
-https://myapp.dev.local
-https://api.dev.local
-```
+## Commands
 
-Your browser will warn about the self-signed certificate on first visit. Accept it (or add Caddy's root CA to your keychain with `caddy trust`).
+| Command | What it does |
+|---|---|
+| `proxima start` | Syncs `/etc/hosts`, writes the Caddyfile, and (re)loads the launchd agent. Running `proxima` with no arguments does the same. Re-run it after editing the config. |
+| `proxima stop` | Unloads the launchd agent, kills Caddy, gost, and the SSH proxy, and removes proxima's entries from `/etc/hosts`. |
+| `proxima status` | Shows daemon, Caddy, and SOCKS5 health, plus the tunnel state of each service. |
+| `proxima ui` | Opens the interactive terminal UI. |
 
-`proxima start` returns immediately — the daemon runs in the background via launchd and will restart automatically on login.
-
-### Check status
-
-```bash
-proxima status
-```
-
-Example output:
+### `proxima status`
 
 ```
 == Proxima: status ==
@@ -238,103 +99,191 @@ daemon: ✔ running (launchd)
 caddy:  ✔ running
 socks5: ✔ reachable (127.0.0.1:1080)
 
-DOMAIN              REMOTE PORT  LOCAL PORT   TUNNEL
-────────────────────────────────────────────────────
-api.dev.local       3000         3000         ✔ up
-myapp.dev.local     7777         7777         ✔ up
+DOMAIN          REMOTE PORT  LOCAL PORT   TUNNEL
+───────────────────────────────────────────────
+myapp.dev.local 7777         7777         ✔ up
+api.dev.local   3000         3000         ✔ up
 ```
 
-### Manage services (TUI)
-
-```bash
-proxima ui
-```
-
-Opens an interactive terminal UI to manage services without editing config files manually:
+### `proxima ui`
 
 ```
-╭─ Proxima ──────────────────────────────────────────────╮
-│ Proxima                                                 │
-│ daemon: ✔  caddy: ✔  socks5: ✔                         │
-│                                                         │
-│   DOMAIN              REMOTE PORT  TUNNEL               │
-│   ──────────────────────────────────────────            │
-│ ▶ myapp.dev.local     7777         ✔ up                 │
-│   api.dev.local       3000         ✔ up                 │
-│                                                         │
-│   [a]dd  [d]elete  [o]pen  [↑↓] select  [q]uit         │
-╰─────────────────────────────────────────────────────────╯
+╭────────────────────────────────────────────────╮
+│ Proxima                                        │
+│ daemon: ✔  caddy: ✔  socks5: ✔                 │
+│                                                │
+│   DOMAIN             REMOTE PORT  TUNNEL       │
+│   ──────────────────────────────────────────   │
+│ ▶ api.dev.local      3000         ✔ up         │
+│   myapp.dev.local    7777         ✔ up         │
+│                                                │
+│   [a]dd  [d]elete  [o]pen  [↑↓] select  [q]uit │
+╰────────────────────────────────────────────────╯
 ```
 
-Keys:
-- `↑↓` or `j/k` — select service
-- `a` — add a new service. Prompts for a domain (bare names like `foo` are auto-completed to `foo.dev.local`; anything containing a dot is used as-is) and a remote port
-- `d` — delete selected service
-- `o` — open selected service in browser
-- `q` / `Esc` — quit
+| Key | Action |
+|---|---|
+| `↑` `↓` / `k` `j` | Move the selection |
+| `a` | Add a service. Enter a domain, then the remote port. A bare name such as `foo` becomes `foo.dev.local`; anything containing a dot is used as-is. |
+| `d` | Delete the selected service (asks for confirmation) |
+| `o` | Open the selected service in your browser |
+| `q` / `Esc` | Quit |
 
-Adding or deleting a service automatically saves `config.json` and runs `proxima start` in the background.
+Status refreshes every second. Adding or deleting a service saves `config.json` (other fields such as `ssh_proxy_host` are kept) and runs `proxima start` in the background. That restart needs `sudo` to update `/etc/hosts`, so the UI works best with the [passwordless sudo rule](#sudo-asks-for-a-password-on-every-start).
 
-### Stop everything
+## Configuration
 
-```bash
-proxima stop
+`~/.proxima/config.json`:
+
+```json
+{
+  "services": {
+    "myapp.dev.local": 7777,
+    "dev.api.example.com": 8080
+  },
+  "ssh_proxy_host": "my-proxy-host"
+}
 ```
 
-Unloads the launchd job, which kills the daemon and all child processes (Caddy + gost), and removes the proxima block from `/etc/hosts`.
+| Field | Required | Description |
+|---|---|---|
+| `services` | yes | Map of local domain to remote port. The domain can use any TLD. proxima points it at `127.0.0.1` through `/etc/hosts`, so it does not need to resolve publicly (and usually shouldn't). At least one service is required. |
+| `ssh_proxy_host` | no | A `Host` alias from `~/.ssh/config`. When set, the daemon runs and supervises the SSH session that provides the SOCKS5 proxy. |
 
-### Re-running start
+The local tunnel port is always the same as the remote port. Make sure each port is free on your Mac.
 
-Run `proxima start` again any time you:
-- Add or remove a service from the config
-- Want to restart everything after a SOCKS5 reconnect
+### Let proxima manage the SSH proxy
 
----
+Set `ssh_proxy_host` to a host from `~/.ssh/config` that forwards SOCKS5 on port 1080:
 
-## File layout
+```ssh-config
+Host my-proxy-host
+  HostName remote.example.com
+  User you
+  DynamicForward 1080
+```
+
+The daemon then runs `ssh -N my-proxy-host` and restarts it whenever it exits:
+
+- **Isolated session.** ControlMaster is turned off, so the proxy never shares a connection with your interactive `ssh` sessions to the same host.
+- **Fast failure detection.** Keepalives every 5 s; the session drops after 2 missed replies.
+- **Wake from sleep.** If the wall clock jumps by more than 10 s (the Mac slept), proxima kills the stale session right away instead of waiting for keepalives to time out.
+- **Backoff.** Retries every 2 s. After 5 consecutive attempts that die within 5 s (wrong host alias, auth failure), it slows to every 5 s.
+
+proxima doesn't try to work out why SSH failed. It keeps retrying, so the proxy comes back within seconds of the network or your credentials recovering.
+
+## How it works
+
+```mermaid
+flowchart TD
+    B["Browser<br/>https://myapp.dev.local"] --> H["/etc/hosts<br/>myapp.dev.local → 127.0.0.1, ::1"]
+    H --> C["Caddy :443<br/>TLS with local CA<br/>Host header rewritten to localhost"]
+    C --> G["gost 127.0.0.1:7777<br/>TCP tunnel"]
+    G --> S["SOCKS5 127.0.0.1:1080<br/>ssh -D / DynamicForward"]
+    S -- "SSH" --> R["Remote machine<br/>localhost:7777"]
+```
+
+1. **DNS.** `proxima start` writes a marked block to `/etc/hosts` and replaces it on every run:
+
+   ```
+   >>> proxima start
+   127.0.0.1 myapp.dev.local
+   ::1       myapp.dev.local
+   <<< proxima end
+   ```
+
+2. **HTTPS.** Caddy terminates TLS for each domain and proxies plain HTTP/1.1 to the local tunnel port. The generated `~/.proxima/Caddyfile` contains one block per service:
+
+   ```caddy
+   https://myapp.dev.local {
+       tls internal
+       reverse_proxy http://127.0.0.1:7777 {
+           header_up Host localhost
+           transport http {
+               versions 1.1
+           }
+       }
+   }
+   ```
+
+   `tls internal` keeps Caddy on its local CA even for domains that look public, so it never asks a public CA (ACME) for a certificate. `header_up Host localhost` makes the request look local to the remote service, which would otherwise see `Host: myapp.dev.local` and might reject it.
+
+3. **Tunnel.** One gost process per service listens on the local port and connects through the SOCKS5 proxy:
+
+   ```
+   gost -L=tcp://127.0.0.1:7777/localhost:7777 -F=socks5://127.0.0.1:1080
+   ```
+
+   The SOCKS5 server on the remote side resolves `localhost`, so the connection lands on the remote machine's own loopback interface.
+
+4. **Processes.** launchd runs `proxima daemon` from `~/Library/LaunchAgents/com.proxima.plist` with `RunAtLoad` and `KeepAlive`. The daemon owns every child process:
+
+   ```
+   launchd
+   └── proxima daemon
+       ├── caddy run
+       ├── gost             (one per service)
+       └── ssh -N <host>    (only with ssh_proxy_host)
+   ```
+
+## Files
 
 ```
 ~/.proxima/
-├── config.json                # your service definitions
-├── Caddyfile                  # generated on each start
-└── logs/
-    ├── daemon.log             # proxima daemon stdout/stderr
-    ├── caddy.log              # Caddy logs (truncated hourly)
-    ├── gost-myapp.dev.local.log  # per-service gost logs (truncated hourly)
-    ├── gost-api.dev.local.log
-    └── ssh-proxy.log          # only present if ssh_proxy_host is configured
+├── config.json                      # your services
+├── Caddyfile                        # regenerated by every `proxima start`
+└── logs/                            # wiped each time the daemon starts
+    ├── caddy.log
+    ├── caddy-<timestamp>.log.gz     # Caddy's own hourly rotation, last 2 kept
+    ├── gost-<domain>.log            # one per service
+    └── ssh-proxy.log                # only with ssh_proxy_host
 
-~/Library/LaunchAgents/
-└── com.proxima.plist          # keeps the daemon running
+~/Library/LaunchAgents/com.proxima.plist
 ```
 
----
+The daemon truncates every log file to zero bytes at the top of each hour.
 
 ## Troubleshooting
 
-**Browser shows "connection refused"**
-The gost tunnel isn't running. Check `proxima status` and run `proxima start` again.
+#### Browser shows "connection refused"
+The tunnel for that service is down. Run `proxima status`, then `proxima start`.
 
-**Browser shows HTTP 400**
-The remote service is rejecting the request. Check that the port in `config.json` is correct and the service is actually running on the remote machine.
+#### Tunnel shows `✗ down`, or gost exits right away
+The SOCKS5 proxy at `127.0.0.1:1080` is unreachable. Check that your `ssh -D` session is running, and look at `~/.proxima/logs/gost-<domain>.log`.
 
-**Browser shows SSL error / certificate not trusted**
-Run `caddy trust` once to add Caddy's local CA to your macOS keychain. You only need to do this once.
+#### `socks5: ✗` while proxima manages SSH
+Read `~/.proxima/logs/ssh-proxy.log`. Usual causes: a typo in `ssh_proxy_host`, a host without `DynamicForward 1080`, or expired SSH credentials.
 
-**`sudo` password prompt on every start**
-This is expected — writing `/etc/hosts` requires root. You can add a sudoers rule to skip the password for this specific command:
+#### Certificate warning in the browser
+Run `caddy trust` once to add Caddy's root CA to the macOS keychain, then restart the browser.
+
+#### HTTP 400 or an unexpected response
+The tunnel works, but the remote service rejected the request. Check the port in `config.json` and that the service is running on the remote machine.
+
+#### Caddy won't start
+Another process probably holds port 443: `sudo lsof -i :443`. Details are in `~/.proxima/logs/caddy.log`.
+
+#### `sudo` asks for a password on every start
+Writing `/etc/hosts` needs root. To allow exactly that copy without a password, run `sudo visudo` and add:
+
 ```
 your_username ALL=(ALL) NOPASSWD: /bin/cp /tmp/hosts.proxima /etc/hosts
 ```
 
-**Tunnels show "down" in status**
-Check `~/.proxima/logs/gost-<domain>.log` for errors. The most common cause is the SOCKS5 proxy not being reachable.
+## Uninstall
 
-**Caddy won't start**
-Check `~/.proxima/logs/caddy.log` for errors. Port 443 may be in use by another process (`sudo lsof -i :443`).
+`proxima stop` leaves the launchd plist in place, so the daemon starts again at your next login. To remove proxima completely:
 
-**gost exits immediately**
-The SOCKS5 proxy at `127.0.0.1:1080` is not reachable. Make sure your SSH tunnel or proxy is running before starting proxima.
+```bash
+proxima stop
+rm ~/Library/LaunchAgents/com.proxima.plist
+rm -rf ~/.proxima
+sudo rm /usr/local/bin/proxima
+```
 
-**SOCKS5 keeps showing "not reachable" when proxima is managing the SSH proxy**
-Check `~/.proxima/logs/ssh-proxy.log` for the actual SSH error. Common causes: the `Host` alias in `ssh_proxy_host` is wrong, the host doesn't have `DynamicForward 1080`, or your SSH credentials need to be renewed.
+## Limitations
+
+- macOS only.
+- The SOCKS5 address is fixed at `127.0.0.1:1080`.
+- Each service uses the same port locally and remotely, so two services can't share a remote port.
+- Remote services always receive `Host: localhost`. Apps that route by hostname won't see the domain you chose.
